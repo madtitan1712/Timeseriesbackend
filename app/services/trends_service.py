@@ -1,8 +1,9 @@
+import numpy as np
+import pandas as pd
 from app.data.loader import get_categories, get_category_history, load_dataset
 from app.services.forecast_service import generate_forecast
 from app.models.registry import get_forecaster
 from app.schemas.trends import TrendsOverviewResponse, MoverInfo, TotalTrend
-import pandas as pd
 
 
 def get_trends_overview(granularity: str = "monthly") -> TrendsOverviewResponse:
@@ -48,8 +49,21 @@ def get_trends_overview(granularity: str = "monthly") -> TrendsOverviewResponse:
         if latest_actual > 0:
             pct_change = ((next_forecast - latest_actual) / latest_actual) * 100
 
+        # --- NEW ANOMALY LOGIC ---
+        history_list = history.tolist()
+        is_anomaly = False
+        if len(history_list) >= 8:
+            # Get trailing context excluding the very latest point (last 12 periods before latest)
+            recent_context = history_list[-13:-1]
+            mean_val = np.mean(recent_context)
+            std_val = np.std(recent_context)
+
+            # Flag if the latest actual deviates by >2 standard deviations from the recent mean
+            if std_val > 0 and abs(latest_actual - mean_val) > (2 * std_val):
+                is_anomaly = True
+        # -------------------------
+
         forecaster = get_forecaster(cat, granularity)
-        is_anomaly = abs(pct_change) > 20.0
 
         category_trends.append(
             MoverInfo(
@@ -62,6 +76,7 @@ def get_trends_overview(granularity: str = "monthly") -> TrendsOverviewResponse:
             )
         )
 
+    # Needs attention still sorts by percentage_change, keeping the signals properly separated
     needs_attention = sorted(category_trends, key=lambda x: abs(x.percentage_change), reverse=True)[:3]
 
     # 2. Generate future dates to append to the historical dates

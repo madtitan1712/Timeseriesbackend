@@ -1,11 +1,11 @@
 import numpy as np
 from app.models.base import Forecaster, ForecastResult
 import timesfm
-
+import torch
 
 class TimesFMModel(Forecaster):
     name = "TimesFM"
-
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     def __init__(self, context_len: int = 512, horizon_len: int = 12):
         self.tfm = timesfm.TimesFm(
             context_len=context_len,
@@ -14,7 +14,7 @@ class TimesFMModel(Forecaster):
             output_patch_len=128,
             num_layers=20,
             model_dims=1280,
-            backend="cpu"  # Swap to "gpu" if CUDA is configured
+            backend=self.device  # Swap to "gpu" if CUDA is configured
         )
         self.tfm.load_from_checkpoint(repo_id="google/timesfm-1.0-200m")
 

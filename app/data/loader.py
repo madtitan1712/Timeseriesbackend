@@ -29,14 +29,17 @@ def load_dataset(granularity: str) -> pd.DataFrame:
     return df
 
 
-def get_categories() -> list[str]:
-    """Extracts the 8 categories dynamically by ignoring the date column."""
-    df = load_dataset("monthly")
+def get_categories(granularity: str = "monthly") -> list[str]:
+    # Bug Fix: Read from the requested granularity instead of hardcoding "monthly"
+    df = load_dataset(granularity)
     if df.empty:
         return []
 
-    # Return all column headers except 'datum'
-    return [col for col in df.columns if col != 'datum']
+    # Assuming the first column is 'datum', the rest are categories
+    cols = list(df.columns)
+    if 'datum' in cols:
+        cols.remove('datum')
+    return sorted(cols)
 
 
 def get_category_history(category: str, granularity: str) -> pd.Series:

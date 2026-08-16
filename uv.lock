@@ -1042,6 +1042,7 @@ dependencies = [
     { name = "pandas-stubs" },
     { name = "pydantic" },
     { name = "timesfm" },
+    { name = "torch" },
     { name = "uvicorn" },
 ]
 
@@ -1054,6 +1055,7 @@ requires-dist = [
     { name = "pandas-stubs", specifier = "~=3.0.5" },
     { name = "pydantic", specifier = ">=2.13.4" },
     { name = "timesfm", specifier = ">=2.0.2" },
+    { name = "torch", specifier = ">=2.13.0" },
     { name = "uvicorn", specifier = ">=0.52.3" },
 ]
 

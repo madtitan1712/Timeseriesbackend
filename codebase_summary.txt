@@ -1,0 +1,676 @@
+=== FILE: app\__init__.py ===
+
+
+=== FILE: app\core\__init__.py ===
+
+
+=== FILE: app\core\config.py ===
+import os
+from pydantic import BaseModel
+
+
+class Settings(BaseModel):
+    PROJECT_NAME: str = "Pharma Sales Dashboard API"
+    # Points to backend/app/data/raw
+    DATA_DIR: str = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "raw")
+
+    # Seasonal periods based on granularity
+    SEASONAL_PERIODS: dict[str, int] = {
+        "daily": 7,
+        "weekly": 52,
+        "monthly": 12
+    }
+
+
+settings = Settings()
+
+=== FILE: app\data\__init__.py ===
+
+
+=== FILE: app\data\loader.py ===
+import pandas as pd
+import os
+from app.core.config import settings
+
+# In-memory cache to prevent reloading CSVs on every request
+_DATA_CACHE: dict[str, pd.DataFrame] = {}
+
+
+def load_dataset(granularity: str) -> pd.DataFrame:
+    """Loads and caches data from the wide-format CSVs."""
+    if granularity in _DATA_CACHE:
+        return _DATA_CACHE[granularity]
+
+    # Maps 'monthly' to 'salesmonthly.csv', 'weekly' to 'salesweekly.csv', etc.
+    filename = f"sales{granularity}.csv"
+    file_path = os.path.join(settings.DATA_DIR, filename)
+
+    if not os.path.exists(file_path):
+        return pd.DataFrame()
+
+    df = pd.read_csv(file_path)
+
+    # Ensure the time column is parsed and sorted properly
+    if 'datum' in df.columns:
+        df['datum'] = pd.to_datetime(df['datum'])
+        df = df.sort_values(by=['datum']).reset_index(drop=True)
+
+    _DATA_CACHE[granularity] = df
+    return df
+
+
+def get_categories(granularity: str = "monthly") -> list[str]:
+    # Bug Fix: Read from the requested granularity instead of hardcoding "monthly"
+    df = load_dataset(granularity)
+    if df.empty:
+        return []
+
+    # Assuming the first column is 'datum', the rest are categories
+    cols = list(df.columns)
+    if 'datum' in cols:
+        cols.remove('datum')
+    return sorted(cols)
+
+
+def get_category_history(category: str, granularity: str) -> pd.Series:
+    """Returns the historical values for a specific category column."""
+    df = load_dataset(granularity)
+
+    if df.empty or category not in df.columns:
+        return pd.Series(dtype=float)
+
+    # Extract just the specific category column, drop any accidental empty trailing rows
+    return df[category].dropna().reset_index(drop=True)
+
+=== FILE: app\main.py ===
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+from app.routes import freshness, forecast, trends, diagnostics, compare, export, audit
+from app.services import trends_service
+
+app = FastAPI(title="Pharma Sales Dashboard API")
+
+# Allow the frontend to communicate with the backend
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Adjust this to "http://localhost:5173" if you want strictness
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+app.include_router(compare.router)
+app.include_router(freshness.router)
+app.include_router(forecast.router)
+app.include_router(trends.router)
+app.include_router(diagnostics.router)
+app.include_router(export.router)
+app.include_router(audit.router)
+@app.get("/health")
+def health_check():
+    """Liveness check for the dashboard build spec."""
+    return {"status": "ok", "message": "Pharma Sales Backend is running."}
+
+@app.get("/categories")
+def list_categories():
+    """List categories + available granularities."""
+    from app.data.loader import get_categories
+    categories = get_categories()
+    return {
+        "categories": categories,
+        "granularities": ["daily", "weekly", "monthly"]
+    }
+
+
+=== FILE: app\models\__init__.py ===
+
+
+=== FILE: app\models\base.py ===
+from abc import ABC, abstractmethod
+from typing import Optional
+import numpy as np
+from pydantic import BaseModel
+
+class ForecastResult(BaseModel):
+    values: list[float]
+    lower: Optional[list[float]] = None
+    upper: Optional[list[float]] = None
+
+class Forecaster(ABC):
+    name: str
+
+    @abstractmethod
+    def predict(self, history: np.ndarray, horizon: int, seasonal_period: int) -> ForecastResult:
+        pass
+
+=== FILE: app\models\baseline.py ===
+import numpy as np
+from app.models.base import Forecaster, ForecastResult
+
+
+class SeasonalNaiveModel(Forecaster):
+    name = "Seasonal Naive"
+
+    def predict(self, history: np.ndarray, horizon: int, seasonal_period: int) -> ForecastResult:
+        if len(history) < seasonal_period:
+            # Fallback to simple naive if history is too short
+            last_val = history[-1] if len(history) > 0 else 0.0
+            return ForecastResult(values=[float(last_val)] * horizon)
+
+        # Repeat the last seasonal period
+        last_season = history[-seasonal_period:]
+        reps = (horizon // seasonal_period) + 1
+        forecast_values = np.tile(last_season, reps)[:horizon]
+
+        return ForecastResult(values=forecast_values.tolist())
+
+=== FILE: app\models\chronos_model.py ===
+import torch
+from chronos import BaseChronosPipeline
+
+
+class ChronosForecaster:
+    def __init__(self):
+        self.name = "Chronos (Bolt)"
+
+        # 1. Device auto-detection (fixes the hardcoded 'cuda' crash)
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        # 2. BaseChronosPipeline for Chronos2/Bolt checkpoints
+        self.pipeline = BaseChronosPipeline.from_pretrained(
+            "amazon/chronos-bolt-small",
+            device_map=device
+        )
+
+    def predict(self, history, horizon: int = 12):
+        # Convert pandas series history to tensor
+        context = torch.tensor(history.values, dtype=torch.float32).unsqueeze(0)
+
+        # Chronos2 (Bolt) generates probabilistic forecasts natively
+        forecast = self.pipeline.predict(context, prediction_length=horizon)
+
+        # Extract median (point forecast) and quantiles (bounds)
+        # Note: Actual quantile extraction depends on your specific Bolt config,
+        # but typically it outputs shape [batch, num_samples/quantiles, horizon]
+
+        # This is a placeholder for the exact extraction logic your data science
+        # team will use to map the Bolt outputs to your schema
+        median_values = forecast[0].median(dim=0).values.tolist()
+        lower_bounds = forecast[0].quantile(0.1, dim=0).tolist()  # 10th percentile
+        upper_bounds = forecast[0].quantile(0.9, dim=0).tolist()  # 90th percentile
+
+        from app.schemas.forecast import ForecastResponse
+        return ForecastResponse(
+            dates=[],  # Dates will be populated by the forecast_service.py wrapper
+            values=median_values,
+            lower=lower_bounds,
+            upper=upper_bounds
+        )
+
+=== FILE: app\models\registry.py ===
+from app.models.base import Forecaster
+from app.models.baseline import SeasonalNaiveModel
+
+_MODEL_CACHE: dict[str, Forecaster] = {}
+_BASELINE = SeasonalNaiveModel()
+
+
+def get_forecaster(category: str, granularity: str) -> Forecaster:
+    """
+    Returns the specific model assigned to a (category, granularity) pair.
+    Implements lazy loading to save memory during startup.
+    """
+
+    # Example mapping: Assign Chronos to 'CategoryA' and TimesFM to 'CategoryB'
+    if category == "CategoryA":
+        if "chronos" not in _MODEL_CACHE:
+            from app.models.chronos_model import ChronosModel
+            _MODEL_CACHE["chronos"] = ChronosModel()
+        return _MODEL_CACHE["chronos"]
+
+    elif category == "CategoryB":
+        if "timesfm" not in _MODEL_CACHE:
+            from app.models.transformer_model import TimesFMModel
+            # Note: you may need to adjust context_len based on granularity
+            _MODEL_CACHE["timesfm"] = TimesFMModel()
+        return _MODEL_CACHE["timesfm"]
+
+    # Default fallback
+    return _BASELINE
+
+=== FILE: app\models\transformer_model.py ===
+import numpy as np
+from app.models.base import Forecaster, ForecastResult
+import timesfm
+import torch
+
+class TimesFMModel(Forecaster):
+    name = "TimesFM"
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    def __init__(self, context_len: int = 512, horizon_len: int = 12):
+        self.tfm = timesfm.TimesFm(
+            context_len=context_len,
+            horizon_len=horizon_len,
+            input_patch_len=32,
+            output_patch_len=128,
+            num_layers=20,
+            model_dims=1280,
+            backend=self.device  # Swap to "gpu" if CUDA is configured
+        )
+        self.tfm.load_from_checkpoint(repo_id="google/timesfm-1.0-200m")
+
+    def predict(self, history: np.ndarray, horizon: int, seasonal_period: int) -> ForecastResult:
+        # TimesFM expects 1D arrays for single series forecasting
+        forecast, _ = self.tfm.forecast(list(history), forecast_context_len=len(history))
+
+        # Slicing to the exact requested horizon
+        point_forecast = forecast[0][:horizon]
+
+        return ForecastResult(values=point_forecast.tolist())
+
+=== FILE: app\routes\__init__.py ===
+
+
+=== FILE: app\routes\audit.py ===
+from fastapi import APIRouter
+from app.schemas.audit import AuditResponse, ModelPerformanceRow
+
+router = APIRouter()
+
+@router.get("/audit/model-performance", response_model=AuditResponse)
+def get_model_audit():
+    """Reads the model-selection team's export file. Mocked for now."""
+    return AuditResponse(
+        metrics=[
+            ModelPerformanceRow(model_name="Seasonal Naive", mase=1.0, smape=15.2, runtime_ms=5),
+            ModelPerformanceRow(model_name="Chronos (Bolt)", mase=0.82, smape=12.1, runtime_ms=450),
+            ModelPerformanceRow(model_name="TimesFM", mase=0.79, smape=11.5, runtime_ms=390),
+            ModelPerformanceRow(model_name="LightGBM", mase=0.85, smape=13.0, runtime_ms=50),
+        ]
+    )
+
+=== FILE: app\routes\categories.py ===
+from fastapi import APIRouter, Query
+from typing import List
+from app.data.loader import get_categories
+
+router = APIRouter()
+
+@router.get("/categories", response_model=List[str])
+def list_categories(granularity: str = Query("monthly", description="Data granularity")):
+    return get_categories(granularity)
+
+=== FILE: app\routes\compare.py ===
+from fastapi import APIRouter, Query
+from typing import Dict
+from app.schemas.forecast import ForecastResponse
+from app.services.forecast_service import generate_forecast
+
+router = APIRouter()
+
+
+@router.get("/compare/forecasts", response_model=Dict[str, ForecastResponse])
+def compare_forecasts(
+        categories: str = Query(..., description="Comma-separated categories, e.g., M01AB,R03"),
+        granularity: str = Query("monthly"),
+        horizon: int = Query(12)
+):
+    """Multi-category overlay data."""
+    cat_list = [c.strip() for c in categories.split(",")]
+    results = {}
+
+    for cat in cat_list:
+        # Reuses the exact single-category forecast orchestration
+        results[cat] = generate_forecast(cat, granularity, horizon)
+
+    return results
+
+=== FILE: app\routes\diagnostics.py ===
+import os
+import pandas as pd
+from fastapi import APIRouter
+from app.schemas.diagnostics import DiagnosticsResponse
+from app.core.config import settings
+
+router = APIRouter()
+
+
+@router.get("/categories/{category}/diagnostics", response_model=DiagnosticsResponse)
+def get_diagnostics(category: str):
+    """Diagnostics panel data, translating raw metrics to plain language."""
+    file_path = os.path.join(settings.DATA_DIR, "diagnostic_features.csv")
+
+    if os.path.exists(file_path):
+        df = pd.read_csv(file_path)
+        if category in df['category'].values:
+            row = df[df['category'] == category].iloc[0]
+
+            # Simple threshold mappings for the UI plain-language descriptions
+            seasonal_val = row.get('seasonal_strength', 0.0)
+            cv_val = row.get('cv', 0.0)
+
+            seasonality_text = "Highly Seasonal" if seasonal_val > 0.7 else "Low Seasonality"
+            volatility_text = "High Volatility" if cv_val > 1.0 else "Stable"
+
+            return DiagnosticsResponse(
+                category=category,
+                seasonality_strength=seasonality_text,
+                volatility=volatility_text,
+                notes="Derived from diagnostic_features.csv"
+            )
+
+    # Mock fallback until the CSV is dropped into the raw data folder
+    return DiagnosticsResponse(
+        category=category,
+        seasonality_strength="Highly Seasonal",
+        volatility="Low Volatility",
+        notes="Mocked data: diagnostic_features.csv not found."
+    )
+
+=== FILE: app\routes\export.py ===
+import io
+import csv
+from fastapi import APIRouter, Query
+from fastapi.responses import StreamingResponse
+from app.services.forecast_service import generate_forecast
+
+router = APIRouter()
+
+
+@router.get("/forecast/{category}/export.csv")
+def export_forecast_csv(
+        category: str,
+        granularity: str = Query("monthly"),
+        horizon: int = Query(12)
+):
+    """CSV export of the forecast data."""
+    forecast_data = generate_forecast(category, granularity, horizon)
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["period_step", "forecast_value", "lower_bound", "upper_bound"])
+
+    for i, val in enumerate(forecast_data.values):
+        lower = forecast_data.lower[i] if forecast_data.lower else ""
+        upper = forecast_data.upper[i] if forecast_data.upper else ""
+        writer.writerow([f"Step+{i + 1}", val, lower, upper])
+
+    output.seek(0)
+
+    headers = {
+        "Content-Disposition": f"attachment; filename={category}_forecast_{granularity}.csv"
+    }
+    return StreamingResponse(output, media_type="text/csv", headers=headers)
+
+=== FILE: app\routes\forecast.py ===
+from fastapi import APIRouter, Query, HTTPException
+from app.schemas.forecast import ForecastResponse
+from app.services.forecast_service import generate_forecast
+
+router = APIRouter()
+
+@router.get("/forecast/{category}", response_model=ForecastResponse)
+def get_forecast(category: str, granularity: str = Query("monthly"), horizon: int = Query(12)):
+    try:
+        return generate_forecast(category, granularity, horizon)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+=== FILE: app\routes\freshness.py ===
+from fastapi import APIRouter
+from app.schemas.freshness import FreshnessResponse
+from app.services.freshness_service import get_freshness_data
+
+router = APIRouter()
+
+@router.get("/data/freshness", response_model=FreshnessResponse)
+def get_freshness():
+    """Returns the last available data date per granularity."""
+    return get_freshness_data()
+
+=== FILE: app\routes\trends.py ===
+from fastapi import APIRouter, Query
+from app.schemas.trends import TrendsOverviewResponse
+from app.services.trends_service import get_trends_overview
+
+router = APIRouter()
+
+@router.get("/trends/overview", response_model=TrendsOverviewResponse)
+def get_trends(granularity: str = Query("monthly", description="Data granularity")):
+    """Home page aggregate data and computed movers."""
+    return get_trends_overview(granularity)
+
+=== FILE: app\schemas\__init__.py ===
+
+
+=== FILE: app\schemas\audit.py ===
+from pydantic import BaseModel
+from typing import List
+
+class ModelPerformanceRow(BaseModel):
+    model_name: str
+    mase: float
+    smape: float
+    runtime_ms: int
+
+class AuditResponse(BaseModel):
+    metrics: List[ModelPerformanceRow]
+
+=== FILE: app\schemas\diagnostics.py ===
+from pydantic import BaseModel
+
+class DiagnosticsResponse(BaseModel):
+    category: str
+    seasonality_strength: str
+    volatility: str
+    notes: str
+
+=== FILE: app\schemas\forecast.py ===
+from pydantic import BaseModel
+from typing import List, Optional
+
+class ForecastResponse(BaseModel):
+    dates: List[str]
+    values: List[float]
+    lower: Optional[List[float]] = None
+    upper: Optional[List[float]] = None
+
+=== FILE: app\schemas\freshness.py ===
+from pydantic import BaseModel
+from typing import Dict
+
+class FreshnessResponse(BaseModel):
+    last_dates: Dict[str, str]
+    notes: Dict[str, str]
+
+=== FILE: app\schemas\trends.py ===
+from pydantic import BaseModel
+from typing import List, Optional
+
+class MoverInfo(BaseModel):
+    category: str
+    latest_actual: float
+    next_forecast: float
+    percentage_change: float
+    serving_model: str
+    is_anomaly: bool
+
+class TotalTrend(BaseModel):
+    dates: List[str]
+    # Change this line: Wrap float in Optional so it accepts None for future dates
+    actuals: List[Optional[float]]
+    forecasts: List[Optional[float]]
+
+class TrendsOverviewResponse(BaseModel):
+    category_trends: List[MoverInfo]
+    needs_attention: List[MoverInfo]
+    total_trend: TotalTrend
+
+=== FILE: app\services\__init__.py ===
+
+
+=== FILE: app\services\forecast_service.py ===
+import pandas as pd
+from app.data.loader import get_category_history, load_dataset
+from app.models.registry import get_forecaster
+from app.schemas.forecast import ForecastResponse
+
+
+def generate_forecast(category: str, granularity: str = "monthly", horizon: int = 12) -> ForecastResponse:
+    history = get_category_history(category, granularity)
+
+    # Bug Fix: Raise exception instead of returning 0s
+    if history.empty:
+        raise ValueError(f"Category '{category}' not found for granularity '{granularity}'")
+
+    forecaster = get_forecaster(category, granularity)
+    forecast_result = forecaster.predict(history, horizon=horizon)
+
+    # Bug Fix: Generate future dates
+    df = load_dataset(granularity)
+    last_date = df['datum'].max()
+    freq_map = {"monthly": "ME", "weekly": "W", "daily": "D"}
+    freq = freq_map.get(granularity, "ME")
+
+    future_dates = pd.date_range(start=last_date, periods=horizon + 1, freq=freq)[1:]
+    future_dates_str = future_dates.strftime('%Y-%m-%d').tolist()
+
+    return ForecastResponse(
+        dates=future_dates_str,
+        values=forecast_result.values,
+        lower=forecast_result.lower,
+        upper=forecast_result.upper
+    )
+
+=== FILE: app\services\freshness_service.py ===
+from app.data.loader import load_dataset
+from app.schemas.freshness import FreshnessResponse
+
+
+def get_freshness_data() -> FreshnessResponse:
+    last_dates = {}
+    notes = {}
+
+    for gran in ["daily", "weekly", "monthly"]:
+        df = load_dataset(gran)
+        if not df.empty and 'datum' in df.columns:
+            last_date = df['datum'].max().strftime('%Y-%m-%d')
+            last_dates[gran] = last_date
+            notes[gran] = "Data loaded successfully."
+        else:
+            last_dates[gran] = "N/A"
+            notes[gran] = "Dataset missing or empty."
+
+    return FreshnessResponse(last_dates=last_dates, notes=notes)
+
+=== FILE: app\services\trends_service.py ===
+import numpy as np
+import pandas as pd
+from app.data.loader import get_categories, get_category_history, load_dataset
+from app.services.forecast_service import generate_forecast
+from app.models.registry import get_forecaster
+from app.schemas.trends import TrendsOverviewResponse, MoverInfo, TotalTrend
+
+
+def get_trends_overview(granularity: str = "monthly") -> TrendsOverviewResponse:
+    categories = get_categories()
+    category_trends = []
+
+    # 1. Prepare historical dates and actuals
+    df = load_dataset(granularity)
+    if df.empty or 'datum' not in df.columns:
+        return TrendsOverviewResponse(category_trends=[], needs_attention=[],
+                                      total_trend=TotalTrend(dates=[], actuals=[], forecasts=[]))
+
+    hist_dates = df['datum'].dt.strftime('%Y-%m-%d').tolist()
+    total_actuals = [0.0] * len(hist_dates)
+
+    # We will forecast 12 periods ahead for the total trend chart
+    horizon = 12
+    total_forecasts = [0.0] * horizon
+
+    for cat in categories:
+        history = get_category_history(cat, granularity)
+        if history.empty:
+            continue
+
+        # Sum up historical actuals
+        for i, val in enumerate(history.tolist()):
+            if i < len(total_actuals):
+                total_actuals[i] += val
+
+        latest_actual = float(history.iloc[-1])
+
+        # Grab the full horizon forecast
+        forecast_res = generate_forecast(cat, granularity, horizon=horizon)
+
+        # Sum up future forecasts across all categories
+        for i, val in enumerate(forecast_res.values):
+            if i < horizon:
+                total_forecasts[i] += val
+
+        next_forecast = float(forecast_res.values[0]) if forecast_res.values else 0.0
+
+        pct_change = 0.0
+        if latest_actual > 0:
+            pct_change = ((next_forecast - latest_actual) / latest_actual) * 100
+
+        # --- NEW ANOMALY LOGIC ---
+        history_list = history.tolist()
+        is_anomaly = False
+        if len(history_list) >= 8:
+            # Get trailing context excluding the very latest point (last 12 periods before latest)
+            recent_context = history_list[-13:-1]
+            mean_val = np.mean(recent_context)
+            std_val = np.std(recent_context)
+
+            # Flag if the latest actual deviates by >2 standard deviations from the recent mean
+            if std_val > 0 and abs(latest_actual - mean_val) > (2 * std_val):
+                is_anomaly = True
+        # -------------------------
+
+        forecaster = get_forecaster(cat, granularity)
+
+        category_trends.append(
+            MoverInfo(
+                category=cat,
+                latest_actual=latest_actual,
+                next_forecast=next_forecast,
+                percentage_change=pct_change,
+                serving_model=forecaster.name,
+                is_anomaly=is_anomaly
+            )
+        )
+
+    # Needs attention still sorts by percentage_change, keeping the signals properly separated
+    needs_attention = sorted(category_trends, key=lambda x: abs(x.percentage_change), reverse=True)[:3]
+
+    # 2. Generate future dates to append to the historical dates
+    last_date = df['datum'].max()
+    # Simple frequency mapping based on granularity
+    freq_map = {"monthly": "ME", "weekly": "W", "daily": "D"}
+    freq = freq_map.get(granularity, "ME")
+
+    future_dates = pd.date_range(start=last_date, periods=horizon + 1, freq=freq)[1:]
+    future_dates_str = future_dates.strftime('%Y-%m-%d').tolist()
+
+    # 3. Combine history and future for the chart
+    # We take the last 12 historical periods + the 12 future periods
+    combined_dates = hist_dates[-12:] + future_dates_str
+
+    # Actuals array: historical numbers + nulls for the future
+    combined_actuals = total_actuals[-12:] + [None] * horizon
+
+    # Forecast array: nulls for history + forecasted numbers for the future
+    combined_forecasts = [None] * 12 + total_forecasts
+
+    return TrendsOverviewResponse(
+        category_trends=category_trends,
+        needs_attention=needs_attention,
+        total_trend=TotalTrend(
+            dates=combined_dates,
+            actuals=combined_actuals,
+            forecasts=combined_forecasts
+        )
+    )
+

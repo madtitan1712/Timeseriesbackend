@@ -10,5 +10,6 @@ dependencies = [
     "pandas-stubs~=3.0.5",
     "pydantic>=2.13.4",
     "timesfm>=2.0.2",
+    "torch>=2.13.0",
     "uvicorn>=0.52.3",
 ]

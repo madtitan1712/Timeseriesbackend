@@ -16,11 +16,18 @@ def get_diagnostics(category: str):
         df = pd.read_csv(file_path)
         if category in df['category'].values:
             row = df[df['category'] == category].iloc[0]
-            # Assumes your CSV has columns that map to these plain-language summaries
+
+            # Simple threshold mappings for the UI plain-language descriptions
+            seasonal_val = row.get('seasonal_strength', 0.0)
+            cv_val = row.get('cv', 0.0)
+
+            seasonality_text = "Highly Seasonal" if seasonal_val > 0.7 else "Low Seasonality"
+            volatility_text = "High Volatility" if cv_val > 1.0 else "Stable"
+
             return DiagnosticsResponse(
                 category=category,
-                seasonality_strength=str(row.get('seasonality', 'Unknown')),
-                volatility=str(row.get('volatility', 'Unknown')),
+                seasonality_strength=seasonality_text,
+                volatility=volatility_text,
                 notes="Derived from diagnostic_features.csv"
             )
 

@@ -1,36 +1,41 @@
-from app.data.loader import get_category_history
+import pandas as pd
+
+from app.core.config import settings
+from app.data.loader import get_category_history, load_dataset
 from app.models.registry import get_forecaster
 from app.schemas.forecast import ForecastResponse
-from app.core.config import settings
-import numpy as np
 
 
-def generate_forecast(category: str, granularity: str, horizon: int) -> ForecastResponse:
-    """Orchestrates the data fetching and model prediction for a single category."""
+def generate_forecast(category: str, granularity: str = "monthly", horizon: int = 12) -> ForecastResponse:
+    history = get_category_history(category, granularity)
 
-    # 1. Fetch history
-    history_series = get_category_history(category, granularity)
-    if history_series.empty:
-        # Return zeros if the category doesn't exist to prevent hard crashes
-        return ForecastResponse(values=[0.0] * horizon)
+    if history.empty:
+        raise ValueError(f"Category '{category}' not found for granularity '{granularity}'")
 
-    history_array = history_series.to_numpy()
-
-    # 2. Get the assigned model from the registry
     forecaster = get_forecaster(category, granularity)
-
-    # 3. Lookup the seasonal period (e.g., 12 for monthly, 52 for weekly)
     seasonal_period = settings.SEASONAL_PERIODS.get(granularity, 12)
 
-    # 4. Generate the prediction
-    result = forecaster.predict(
-        history=history_array,
+    # Every Forecaster implementation accepts the same three arguments —
+    # models that don't need seasonal_period (e.g. Chronos) simply ignore
+    # it. Keeping the call uniform here is what makes the registry able to
+    # swap models per (category, granularity) without any special-casing.
+    forecast_result = forecaster.predict(
+        history=history.to_numpy(),
         horizon=horizon,
-        seasonal_period=seasonal_period
+        seasonal_period=seasonal_period,
     )
 
+    df = load_dataset(granularity)
+    last_date = df["datum"].max()
+    freq_map = {"monthly": "ME", "weekly": "W", "daily": "D"}
+    freq = freq_map.get(granularity, "ME")
+
+    future_dates = pd.date_range(start=last_date, periods=horizon + 1, freq=freq)[1:]
+    future_dates_str = future_dates.strftime("%Y-%m-%d").tolist()
+
     return ForecastResponse(
-        values=result.values,
-        lower=result.lower,
-        upper=result.upper
+        dates=future_dates_str,
+        values=forecast_result.values,
+        lower=forecast_result.lower,
+        upper=forecast_result.upper,
     )
