@@ -14,5 +14,11 @@ class Settings(BaseModel):
         "monthly": 12
     }
 
+    # The canonical list of actual sellable drug categories.
+    # Acts as a whitelist to ignore metadata columns (Year, Month, Hour, etc.)
+    CATEGORY_COLUMNS: set[str] = {
+        "M01AB", "M01AE", "N02BA", "N02BE", "N05B", "N05C", "R03", "R06"
+    }
+
 
 settings = Settings()

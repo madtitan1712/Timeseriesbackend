@@ -7,7 +7,7 @@ from app.schemas.trends import TrendsOverviewResponse, MoverInfo, TotalTrend
 
 
 def get_trends_overview(granularity: str = "monthly") -> TrendsOverviewResponse:
-    categories = get_categories()
+    categories = get_categories(granularity)
     category_trends = []
 
     # 1. Prepare historical dates and actuals

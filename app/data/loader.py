@@ -30,17 +30,15 @@ def load_dataset(granularity: str) -> pd.DataFrame:
 
 
 def get_categories(granularity: str = "monthly") -> list[str]:
-    # Bug Fix: Read from the requested granularity instead of hardcoding "monthly"
+    # Read from the requested granularity
     df = load_dataset(granularity)
     if df.empty:
         return []
 
-    # Assuming the first column is 'datum', the rest are categories
-    cols = list(df.columns)
-    if 'datum' in cols:
-        cols.remove('datum')
+    # Only return columns that are actual sales categories — this safely
+    # ignores datum, Year, Month, Hour, Weekday Name, etc.
+    cols = [c for c in df.columns if c in settings.CATEGORY_COLUMNS]
     return sorted(cols)
-
 
 def get_category_history(category: str, granularity: str) -> pd.Series:
     """Returns the historical values for a specific category column."""
