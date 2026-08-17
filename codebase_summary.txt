@@ -30,7 +30,147 @@ class Settings(BaseModel):
 
 settings = Settings()
 
+=== FILE: app\core\recommendation_config.py ===
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+
+@dataclass(frozen=True)
+class RecommendationWeights:
+    freshness_weight: float = 0.30
+    model_quality_weight: float = 0.30
+    forecast_consistency_weight: float = 0.20
+    volatility_penalty_weight: float = 0.10
+    missing_data_penalty_weight: float = 0.10
+
+
+@dataclass(frozen=True)
+class RecommendationThresholds:
+    strong_growth_pct: float = 15.0
+    strong_decline_pct: float = -15.0
+    high_volatility_score: float = 0.75
+    strong_seasonality_score: float = 0.75
+    stale_days_threshold: int = 7
+    anomaly_confidence_penalty: float = 0.15
+    low_confidence_floor: float = 0.35
+
+
+RECOMMENDATION_WEIGHTS = RecommendationWeights()
+RECOMMENDATION_THRESHOLDS = RecommendationThresholds()
+
+
+DEFAULT_ASSUMPTIONS = [
+    "Uses current forecast and freshness signals.",
+    "Model quality and data freshness are included in the confidence score.",
+    "No retraining occurs during request-time inference.",
+]
+
+
+def clamp(value: float, low: float = 0.0, high: float = 1.0) -> float:
+    return max(low, min(high, value))
+
+
+=== FILE: app\core\security.py ===
+import os
+from datetime import datetime, timedelta, timezone
+
+import jwt
+from pwdlib import PasswordHash
+
+
+# Argon2 password hashing
+password_hash = PasswordHash.recommended()
+
+
+# IMPORTANT:
+# Change this value in production.
+SECRET_KEY = os.getenv(
+    "JWT_SECRET_KEY",
+    "change-this-development-secret-key"
+)
+
+ALGORITHM = "HS256"
+
+ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24
+
+
+def hash_password(password: str) -> str:
+    return password_hash.hash(password)
+
+
+def verify_password(password: str, hashed_password: str) -> bool:
+    return password_hash.verify(password, hashed_password)
+
+
+def create_access_token(user_id: int, email: str) -> str:
+    expire = datetime.now(timezone.utc) + timedelta(
+        minutes=ACCESS_TOKEN_EXPIRE_MINUTES
+    )
+
+    payload = {
+        "sub": str(user_id),
+        "email": email,
+        "exp": expire,
+    }
+
+    return jwt.encode(
+        payload,
+        SECRET_KEY,
+        algorithm=ALGORITHM,
+    )
+
+
+def decode_access_token(token: str) -> dict:
+    return jwt.decode(
+        token,
+        SECRET_KEY,
+        algorithms=[ALGORITHM],
+    )
+
 === FILE: app\data\__init__.py ===
+
+
+=== FILE: app\data\auth_database.py ===
+import sqlite3
+from pathlib import Path
+
+
+# Project root:
+# Timeseriesbackend/
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+DATA_DIR = PROJECT_ROOT / "data"
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+DB_PATH = DATA_DIR / "auth.db"
+
+
+def get_connection():
+    connection = sqlite3.connect(DB_PATH)
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+def init_auth_db():
+    connection = get_connection()
+
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            email TEXT NOT NULL UNIQUE,
+            password_hash TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+
+    connection.commit()
+    connection.close()
+
+=== FILE: app\data\database.py ===
 
 
 === FILE: app\data\loader.py ===
@@ -87,22 +227,30 @@ def get_category_history(category: str, granularity: str) -> pd.Series:
     return df[category].dropna().reset_index(drop=True)
 
 === FILE: app\main.py ===
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.routes import audit, categories, compare, diagnostics, export, forecast, freshness, trends
+from app.routes import audit,auth, categories, compare, diagnostics, export, forecast, freshness, recommendations, trends
 
 app = FastAPI(title="Pharma Sales Dashboard API")
+from app.data.auth_database import init_auth_db
 
-# allow_credentials=False here deliberately: allow_origins=["*"] combined
-# with allow_credentials=True is rejected by browsers per the CORS spec
-# (a wildcard origin can't be paired with credentialed requests). This app
-# doesn't use cookies/auth, so there's nothing to gain from credentials
-# support — if that changes later, set an explicit origin list instead of
-# "*" and turn allow_credentials back on.
+init_auth_db()
+allowed_origins = os.getenv(
+    "CORS_ALLOWED_ORIGINS",
+    "http://localhost:3000,http://localhost:5173,http://127.0.0.1:3000,http://127.0.0.1:5173,http://localhost:8080,http://127.0.0.1:8080",
+).split(",")
+
+# Browsers block cross-origin requests unless the API explicitly allows the
+# frontend origin. Keep this list explicit instead of a wildcard because
+# wildcard origins are not compatible with credentialed requests.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=allowed_origins,
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -116,7 +264,8 @@ app.include_router(trends.router)
 app.include_router(diagnostics.router)
 app.include_router(export.router)
 app.include_router(audit.router)
-
+app.include_router(recommendations.router)
+app.include_router(auth.router)
 
 @app.get("/health")
 def health_check():
@@ -312,50 +461,69 @@ class LightGBMForecaster(Forecaster):
         return ForecastResult(values=predictions)
 
 === FILE: app\models\registry.py ===
+# app/models/registry.py
+import logging
+import threading
 from app.models.base import Forecaster
 from app.models.baseline import SeasonalNaiveModel
+
+logger = logging.getLogger(__name__)
 
 # Cache is keyed by (category, granularity), not category alone — the same
 # category can have a different best-performing model per granularity
 # (confirmed empirically during this project's offline model validation),
 # so the lookup and the cache both need the full pair as the key.
 _MODEL_CACHE: dict[tuple[str, str], Forecaster] = {}
+_MODEL_CACHE_LOCK = threading.Lock()
 _BASELINE = SeasonalNaiveModel()
+
+# TimesFM is a zero-shot foundation model — it isn't fine-tuned per category,
+# so the four (category, granularity) pairs assigned to it below all share
+# ONE loaded instance instead of each paying their own ~200M-param load.
+_TIMESFM_SINGLETON: Forecaster | None = None
+_TIMESFM_LOCK = threading.Lock()
 
 # Assignments extracted directly from pharma_tier_and_model_architecture.xlsx
 _ASSIGNMENTS: dict[tuple[str, str], str] = {
-    # N02BE: Analgesics / Antipyretics (Paracetamol)
     ("N02BE", "daily"): "lightgbm",
     ("N02BE", "weekly"): "theta",
-
-    # M01AB: Anti-inflammatory (Acetic acid derivatives)
     ("M01AB", "daily"): "lightgbm",
     ("M01AB", "weekly"): "lightgbm",
-
-    # N02BA: Analgesics (Salicylic acid derivatives)
     ("N02BA", "daily"): "theta",
     ("N02BA", "weekly"): "timesfm",
-
-    # N05B: Psycholeptics / Anxiolytics
     ("N05B", "daily"): "lightgbm",
     ("N05B", "weekly"): "timesfm",
-
-    # M01AE: Anti-inflammatory (Propionic acid derivatives)
     ("M01AE", "daily"): "lightgbm",
     ("M01AE", "weekly"): "theta",
-
-    # N05C: Hypnotics and Sedatives
     ("N05C", "daily"): "timesfm",
     ("N05C", "weekly"): "xgboost",
-
-    # R03: Drugs for Obstructive Airway Diseases
     ("R03", "daily"): "timesfm",
     ("R03", "weekly"): "xgboost",
-
-    # R06: Antihistamines for Systemic Use
     ("R06", "daily"): "lightgbm",
     ("R06", "weekly"): "lightgbm",
 }
+
+
+def _get_timesfm_instance() -> Forecaster:
+    """Returns the single shared TimesFM instance, loading it on first call.
+
+    Double-checked locking: the outer check avoids taking the lock on every
+    call once warm, the inner check (after acquiring the lock) avoids two
+    threads racing to load it simultaneously on cold start.
+    """
+    global _TIMESFM_SINGLETON
+
+    if _TIMESFM_SINGLETON is not None:
+        return _TIMESFM_SINGLETON
+
+    with _TIMESFM_LOCK:
+        if _TIMESFM_SINGLETON is None:
+            from app.models.transformer_model import TimesFMModel
+            logger.info("Loading TimesFM (shared across all assigned categories)...")
+            _TIMESFM_SINGLETON = TimesFMModel()
+            logger.info("TimesFM loaded.")
+
+    return _TIMESFM_SINGLETON
 
 
 def get_forecaster(category: str, granularity: str) -> Forecaster:
@@ -363,38 +531,63 @@ def get_forecaster(category: str, granularity: str) -> Forecaster:
 
     Falls back to SeasonalNaiveModel for any pair with no explicit
     assignment yet. Real models are lazily instantiated on first use and
-    cached per (category, granularity).
+    cached per (category, granularity) — except TimesFM, which is shared
+    (see _get_timesfm_instance).
     """
     key = (category, granularity)
 
     if key in _MODEL_CACHE:
         return _MODEL_CACHE[key]
 
-    model_id = _ASSIGNMENTS.get(key)
+    with _MODEL_CACHE_LOCK:
+        # Re-check after acquiring the lock — another thread may have
+        # populated this key while we were waiting for it.
+        if key in _MODEL_CACHE:
+            return _MODEL_CACHE[key]
 
-    if model_id == "chronos":
-        from app.models.chronos_model import ChronosForecaster
-        forecaster = ChronosForecaster()
-    elif model_id == "timesfm":
-        from app.models.transformer_model import TimesFMModel
-        forecaster = TimesFMModel()
-    elif model_id == "lightgbm":
-        from app.models.lightgbm_model import LightGBMForecaster
-        # Pass both category and granularity to load the exact joblib file
-        forecaster = LightGBMForecaster(category=category, granularity=granularity)
-    elif model_id == "theta":
-        from app.models.theta_model import ThetaForecaster
-        forecaster = ThetaForecaster()
-    elif model_id == "xgboost":
-        from app.models.xgboost_model import XGBoostForecaster
-        # Only pass category; XGBoost handles weekly natively now
-        forecaster = XGBoostForecaster(category=category)
-    else:
-        # Fallback for categories or granularities (e.g. monthly) not explicitly defined
-        forecaster = _BASELINE
+        model_id = _ASSIGNMENTS.get(key)
 
-    _MODEL_CACHE[key] = forecaster
-    return forecaster
+        if model_id == "chronos":
+            from app.models.chronos_model import ChronosForecaster
+            forecaster = ChronosForecaster()
+        elif model_id == "timesfm":
+            forecaster = _get_timesfm_instance()
+        elif model_id == "lightgbm":
+            from app.models.lightgbm_model import LightGBMForecaster
+            forecaster = LightGBMForecaster(category=category, granularity=granularity)
+        elif model_id == "theta":
+            from app.models.theta_model import ThetaForecaster
+            forecaster = ThetaForecaster()
+        elif model_id == "xgboost":
+            from app.models.xgboost_model import XGBoostForecaster
+            forecaster = XGBoostForecaster(category=category)
+        else:
+            forecaster = _BASELINE
+
+        _MODEL_CACHE[key] = forecaster
+        return forecaster
+
+
+def warm_up_models() -> None:
+    """Eagerly loads every assigned model at startup instead of on first
+    request. Reuses get_forecaster() itself so there's exactly one code
+    path for "load a model" — warm-up and lazy-load can never drift apart.
+
+    A missing artifact here is handled the same way it is in
+    trends_service/compare.py: log and skip, don't let one bad category
+    stop the rest of the app from starting.
+    """
+    logger.info(f"Warming up {len(_ASSIGNMENTS)} model assignments...")
+    failures = []
+
+    for category, granularity in _ASSIGNMENTS:
+        try:
+            get_forecaster(category, granularity)
+        except Exception as e:
+            logger.warning(f"Warm-up failed for {category}/{granularity}: {e}")
+            failures.append((category, granularity))
+
+    logger.info(f"Warm-up complete. {len(_ASSIGNMENTS) - len(failures)} loaded, {len(failures)} failed.")
 
 === FILE: app\models\theta_model.py ===
 import numpy as np
@@ -563,6 +756,132 @@ def get_audit():
     to refresh — this endpoint does not compute metrics on request."""
     return get_model_audit()
 
+=== FILE: app\routes\auth.py ===
+import jwt
+
+from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+
+from app.core.security import decode_access_token
+from app.schemas.auth import (
+    LoginRequest,
+    SignupRequest,
+    TokenResponse,
+    UserResponse,
+)
+from app.services.auth_service import (
+    create_user,
+    get_user_by_id,
+    login_user,
+)
+
+
+router = APIRouter(
+    prefix="/auth",
+    tags=["Authentication"],
+)
+
+
+security = HTTPBearer()
+
+
+@router.post(
+    "/signup",
+    response_model=UserResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def signup(payload: SignupRequest):
+    try:
+        user = create_user(
+            name=payload.name,
+            email=str(payload.email),
+            password=payload.password,
+        )
+
+        return user
+
+    except ValueError as error:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(error),
+        )
+
+
+@router.post(
+    "/login",
+    response_model=TokenResponse,
+)
+def login(payload: LoginRequest):
+    result = login_user(
+        email=str(payload.email),
+        password=payload.password,
+    )
+
+    if not result:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid email or password",
+        )
+
+    return result
+
+
+def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+):
+    token = credentials.credentials
+
+    try:
+        payload = decode_access_token(token)
+
+        user_id = payload.get("sub")
+
+        if not user_id:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid authentication token",
+            )
+
+        try:
+            user_id = int(user_id)
+        except ValueError:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid authentication token",
+            )
+
+        user = get_user_by_id(user_id)
+
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="User no longer exists",
+            )
+
+        return user
+
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication token has expired",
+        )
+
+    except jwt.InvalidTokenError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authentication token",
+        )
+
+
+@router.get(
+    "/me",
+    response_model=UserResponse,
+)
+def get_me(
+    current_user=Depends(get_current_user),
+):
+    return current_user
+
 === FILE: app\routes\categories.py ===
 from fastapi import APIRouter, Query
 
@@ -587,12 +906,15 @@ def list_categories(granularity: str = Query("weekly", description="Data granula
     }
 
 === FILE: app\routes\compare.py ===
+# app/routes/compare.py
+import logging
 from fastapi import APIRouter, Query
 from typing import Dict
 from app.schemas.forecast import ForecastResponse
 from app.services.forecast_service import generate_forecast
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 @router.get("/compare/forecasts", response_model=Dict[str, ForecastResponse])
@@ -601,13 +923,20 @@ def compare_forecasts(
         granularity: str = Query("weekly"),
         horizon: int = Query(12)
 ):
-    """Multi-category overlay data."""
+    """Multi-category overlay data. Categories that fail to forecast (missing
+    model artifact, bad category name, etc.) are omitted from the response
+    rather than failing the whole request — check the server logs if a
+    category you expected is missing."""
     cat_list = [c.strip() for c in categories.split(",")]
     results = {}
 
     for cat in cat_list:
-        # Reuses the exact single-category forecast orchestration
-        results[cat] = generate_forecast(cat, granularity, horizon)
+        try:
+            # Reuses the exact single-category forecast orchestration
+            results[cat] = generate_forecast(cat, granularity, horizon)
+        except Exception as e:
+            logger.warning(f"Skipping {cat}/{granularity} in compare_forecasts: {e}")
+            continue
 
     return results
 
@@ -704,6 +1033,42 @@ def get_freshness():
     """Returns the last available data date per granularity."""
     return get_freshness_data()
 
+=== FILE: app\routes\recommendations.py ===
+from fastapi import APIRouter, HTTPException, Query
+
+from app.services.recommendations_service import (
+    get_category_recommendations,
+    get_portfolio_recommendations,
+)
+
+router = APIRouter()
+
+
+@router.get("/recommendations/portfolio")
+def portfolio_recommendations(
+    granularity: str = Query("monthly", description="daily|weekly|monthly"),
+):
+    """Return ranked portfolio recommendations for the selected granularity."""
+    if granularity not in {"daily", "weekly", "monthly"}:
+        raise HTTPException(status_code=400, detail="Granularity must be one of daily, weekly, monthly.")
+    return get_portfolio_recommendations(granularity=granularity)
+
+
+@router.get("/recommendations/category/{category}")
+def category_recommendations(
+    category: str,
+    granularity: str = Query("monthly", description="daily|weekly|monthly"),
+    horizon: int = Query(12, ge=1, le=24),
+):
+    """Return primary and secondary recommendations for a category."""
+    if granularity not in {"daily", "weekly", "monthly"}:
+        raise HTTPException(status_code=400, detail="Granularity must be one of daily, weekly, monthly.")
+    try:
+        return get_category_recommendations(category=category, granularity=granularity, horizon=horizon)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
 === FILE: app\routes\trends.py ===
 from fastapi import APIRouter, Query
 from app.schemas.trends import TrendsOverviewResponse
@@ -735,6 +1100,32 @@ class AuditResponse(BaseModel):
     evaluated_at: Optional[str] = None
     skipped_count: int = 0
 
+=== FILE: app\schemas\auth.py ===
+from pydantic import BaseModel, EmailStr, Field
+
+
+class SignupRequest(BaseModel):
+    name: str = Field(..., min_length=2, max_length=100)
+    email: EmailStr
+    password: str = Field(..., min_length=6, max_length=128)
+
+
+class LoginRequest(BaseModel):
+    email: EmailStr
+    password: str
+
+
+class UserResponse(BaseModel):
+    id: int
+    name: str
+    email: EmailStr
+
+
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str
+    user: UserResponse
+
 === FILE: app\schemas\diagnostics.py ===
 from pydantic import BaseModel
 
@@ -761,6 +1152,44 @@ from typing import Dict
 class FreshnessResponse(BaseModel):
     last_dates: Dict[str, str]
     notes: Dict[str, str]
+
+=== FILE: app\schemas\recommendations.py ===
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Optional
+
+from pydantic import BaseModel, Field
+
+
+class RecommendationEvidence(BaseModel):
+    forecast_change_pct: float
+    volatility_level: str
+    seasonality_strength: str
+    anomaly_flag: bool
+    data_staleness_days: int
+    selected_model: str
+    model_quality_score: float
+
+
+class RecommendationItem(BaseModel):
+    recommendation_id: str
+    scope: str = Field(..., pattern="^(portfolio|category)$")
+    category: Optional[str] = None
+    priority: str = Field(..., pattern="^(high|medium|low)$")
+    action: str
+    rationale: str
+    evidence: RecommendationEvidence
+    confidence_score: float = Field(..., ge=0.0, le=1.0)
+    assumptions: list[str] = Field(default_factory=list)
+    created_at: datetime
+
+
+class RecommendationFeedback(BaseModel):
+    recommendation_id: str
+    accepted: bool
+    comments: Optional[str] = None
+
 
 === FILE: app\schemas\trends.py ===
 from pydantic import BaseModel
@@ -827,6 +1256,151 @@ def get_model_audit() -> dict:
         "evaluated_at": data["evaluated_at"],
         "skipped_count": len(data.get("skipped", [])),
     }
+
+=== FILE: app\services\auth_service.py ===
+import sqlite3
+
+from app.core.security import (
+    create_access_token,
+    hash_password,
+    verify_password,
+)
+from app.data.auth_database import get_connection
+
+
+def create_user(name: str, email: str, password: str):
+    email = email.strip().lower()
+
+    connection = get_connection()
+
+    try:
+        existing_user = connection.execute(
+            "SELECT id FROM users WHERE email = ?",
+            (email,),
+        ).fetchone()
+
+        if existing_user:
+            raise ValueError("An account with this email already exists.")
+
+        password_hash = hash_password(password)
+
+        cursor = connection.execute(
+            """
+            INSERT INTO users (
+                name,
+                email,
+                password_hash
+            )
+            VALUES (?, ?, ?)
+            """,
+            (
+                name.strip(),
+                email,
+                password_hash,
+            ),
+        )
+
+        connection.commit()
+
+        user_id = cursor.lastrowid
+
+        return {
+            "id": user_id,
+            "name": name.strip(),
+            "email": email,
+        }
+
+    except sqlite3.IntegrityError:
+        connection.rollback()
+        raise ValueError("An account with this email already exists.")
+
+    finally:
+        connection.close()
+
+
+def authenticate_user(email: str, password: str):
+    email = email.strip().lower()
+
+    connection = get_connection()
+
+    try:
+        user = connection.execute(
+            """
+            SELECT
+                id,
+                name,
+                email,
+                password_hash
+            FROM users
+            WHERE email = ?
+            """,
+            (email,),
+        ).fetchone()
+
+        if not user:
+            return None
+
+        if not verify_password(
+            password,
+            user["password_hash"],
+        ):
+            return None
+
+        return {
+            "id": user["id"],
+            "name": user["name"],
+            "email": user["email"],
+        }
+
+    finally:
+        connection.close()
+
+
+def login_user(email: str, password: str):
+    user = authenticate_user(email, password)
+
+    if not user:
+        return None
+
+    token = create_access_token(
+        user_id=user["id"],
+        email=user["email"],
+    )
+
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "user": user,
+    }
+
+
+def get_user_by_id(user_id: int):
+    connection = get_connection()
+
+    try:
+        user = connection.execute(
+            """
+            SELECT
+                id,
+                name,
+                email
+            FROM users
+            WHERE id = ?
+            """,
+            (user_id,),
+        ).fetchone()
+
+        if not user:
+            return None
+
+        return {
+            "id": user["id"],
+            "name": user["name"],
+            "email": user["email"],
+        }
+
+    finally:
+        connection.close()
 
 === FILE: app\services\diagnostics_service.py ===
 import numpy as np
@@ -946,7 +1520,336 @@ def get_freshness_data() -> FreshnessResponse:
 
     return FreshnessResponse(last_dates=last_dates, notes=notes)
 
+=== FILE: app\services\recommendations_service.py ===
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from typing import Any
+
+from app.core.recommendation_config import (
+    DEFAULT_ASSUMPTIONS,
+    RECOMMENDATION_THRESHOLDS,
+    RECOMMENDATION_WEIGHTS,
+    clamp,
+)
+from app.data.loader import get_categories, get_category_history, load_dataset
+from app.services.forecast_service import generate_forecast
+from app.services.freshness_service import get_freshness_data
+from app.models.registry import get_forecaster
+
+
+def _normalize_volatility(value: Any) -> str:
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"high", "elevated", "volatile"}:
+            return "high"
+        if normalized in {"medium", "moderate"}:
+            return "medium"
+        if normalized in {"low", "stable", "normal"}:
+            return "low"
+    return "medium"
+
+
+def _normalize_seasonality(value: Any) -> str:
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"high", "strong", "highly seasonal", "seasonal"}:
+            return "high"
+        if normalized in {"medium", "moderate"}:
+            return "medium"
+        if normalized in {"low", "weak", "low seasonality"}:
+            return "low"
+    return "medium"
+
+
+def _coerce_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _compute_freshness_score(data_staleness_days: int) -> float:
+    if data_staleness_days <= 0:
+        return 1.0
+    if data_staleness_days >= RECOMMENDATION_THRESHOLDS.stale_days_threshold:
+        return 0.4
+    return 1.0 - min(0.6, data_staleness_days / RECOMMENDATION_THRESHOLDS.stale_days_threshold * 0.6)
+
+
+def compute_confidence(
+    freshness_score: float,
+    model_quality_score: float,
+    forecast_consistency: float,
+    volatility_penalty: float,
+    missing_data_penalty: float,
+) -> float:
+    score = (
+        RECOMMENDATION_WEIGHTS.freshness_weight * freshness_score
+        + RECOMMENDATION_WEIGHTS.model_quality_weight * model_quality_score
+        + RECOMMENDATION_WEIGHTS.forecast_consistency_weight * forecast_consistency
+        - RECOMMENDATION_WEIGHTS.volatility_penalty_weight * volatility_penalty
+        - RECOMMENDATION_WEIGHTS.missing_data_penalty_weight * missing_data_penalty
+    )
+    return clamp(score)
+
+
+def _determine_priority(forecast_change_pct: float, data_staleness_days: int, anomaly_flag: bool) -> str:
+    if anomaly_flag or data_staleness_days >= RECOMMENDATION_THRESHOLDS.stale_days_threshold:
+        return "high"
+    if forecast_change_pct >= RECOMMENDATION_THRESHOLDS.strong_growth_pct or forecast_change_pct <= RECOMMENDATION_THRESHOLDS.strong_decline_pct:
+        return "high"
+    if abs(forecast_change_pct) >= 8.0:
+        return "medium"
+    return "low"
+
+
+def _make_action(forecast_change_pct: float, volatility_level: str, seasonality_strength: str, anomaly_flag: bool) -> str:
+    if anomaly_flag:
+        return "Escalate to pharmacist review before purchasing or replenishment."
+    if forecast_change_pct > RECOMMENDATION_THRESHOLDS.strong_growth_pct:
+        return "Increase reorder quantity and tighten replenishment cadence."
+    if forecast_change_pct < RECOMMENDATION_THRESHOLDS.strong_decline_pct:
+        return "Reduce stock exposure and delay non-critical replenishment."
+    if volatility_level == "high":
+        return "Use smaller, more frequent purchase cycles to reduce stock risk."
+    if seasonality_strength == "high":
+        return "Pre-build seasonal buffer inventory before the next demand spike."
+    return "Maintain current stocking policy and monitor the next review window."
+
+
+def _make_rationale(
+    forecast_change_pct: float,
+    volatility_level: str,
+    seasonality_strength: str,
+    anomaly_flag: bool,
+    data_staleness_days: int,
+) -> str:
+    reasons = []
+    if anomaly_flag:
+        reasons.append("an anomaly was detected in recent activity")
+    if forecast_change_pct > 0:
+        reasons.append(f"forecast demand is up {forecast_change_pct:.1f}% over the next horizon")
+    elif forecast_change_pct < 0:
+        reasons.append(f"forecast demand is down {abs(forecast_change_pct):.1f}% over the next horizon")
+    else:
+        reasons.append("forecast trend remains near neutral")
+    if volatility_level == "high":
+        reasons.append("volatility is elevated, which raises replenishment risk")
+    if seasonality_strength == "high":
+        reasons.append("seasonality is strong and should be planned for in advance")
+    if data_staleness_days >= RECOMMENDATION_THRESHOLDS.stale_days_threshold:
+        reasons.append("data freshness is stale, so confidence should be reduced")
+    return "; ".join(reasons) if reasons else "No material operating concern detected."
+
+
+def build_category_recommendations(
+    category: str,
+    granularity: str,
+    horizon: int,
+    forecast_change_pct: float,
+    volatility_level: str,
+    seasonality_strength: str,
+    anomaly_flag: bool,
+    data_staleness_days: int,
+    selected_model: str,
+    model_quality_score: float,
+    forecast_consistency: float,
+) -> list[dict[str, Any]]:
+    if not category:
+        raise ValueError("Category is required for category-level recommendations.")
+
+    forecast_change_pct = _coerce_float(forecast_change_pct, 0.0)
+    volatility_level = _normalize_volatility(volatility_level)
+    seasonality_strength = _normalize_seasonality(seasonality_strength)
+    selected_model = selected_model or "Seasonal Naive"
+    model_quality_score = clamp(_coerce_float(model_quality_score, 0.5), 0.0, 1.0)
+    forecast_consistency = clamp(_coerce_float(forecast_consistency, 0.5), 0.0, 1.0)
+
+    freshness_score = _compute_freshness_score(data_staleness_days)
+    volatility_penalty = 0.5 if volatility_level == "high" else 0.2 if volatility_level == "medium" else 0.0
+    missing_data_penalty = 0.0 if data_staleness_days <= 5 else 0.2
+    confidence = compute_confidence(
+        freshness_score=freshness_score,
+        model_quality_score=model_quality_score,
+        forecast_consistency=forecast_consistency,
+        volatility_penalty=volatility_penalty,
+        missing_data_penalty=missing_data_penalty,
+    )
+
+    priority = _determine_priority(forecast_change_pct, data_staleness_days, anomaly_flag)
+    action = _make_action(forecast_change_pct, volatility_level, seasonality_strength, anomaly_flag)
+    rationale = _make_rationale(forecast_change_pct, volatility_level, seasonality_strength, anomaly_flag, data_staleness_days)
+
+    primary = {
+        "recommendation_id": f"rec-cat-{category.lower()}-{granularity}-{horizon}-{int(datetime.now(timezone.utc).timestamp())}",
+        "scope": "category",
+        "category": category,
+        "priority": priority,
+        "action": action,
+        "rationale": rationale,
+        "evidence": {
+            "forecast_change_pct": forecast_change_pct,
+            "volatility_level": volatility_level,
+            "seasonality_strength": seasonality_strength,
+            "anomaly_flag": bool(anomaly_flag),
+            "data_staleness_days": int(data_staleness_days),
+            "selected_model": selected_model,
+            "model_quality_score": model_quality_score,
+        },
+        "confidence_score": round(confidence, 4),
+        "assumptions": list(DEFAULT_ASSUMPTIONS),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    secondary = []
+    if volatility_level == "high":
+        secondary.append(
+            {
+                "recommendation_id": f"rec-cat-{category.lower()}-{granularity}-safety-{int(datetime.now(timezone.utc).timestamp())}",
+                "scope": "category",
+                "category": category,
+                "priority": "medium",
+                "action": "Reduce order batch size and increase review frequency.",
+                "rationale": "High volatility suggests demand swings are likely to create stock imbalance.",
+                "evidence": {
+                    "forecast_change_pct": forecast_change_pct,
+                    "volatility_level": volatility_level,
+                    "seasonality_strength": seasonality_strength,
+                    "anomaly_flag": bool(anomaly_flag),
+                    "data_staleness_days": int(data_staleness_days),
+                    "selected_model": selected_model,
+                    "model_quality_score": model_quality_score,
+                },
+                "confidence_score": round(max(0.35, confidence - 0.1), 4),
+                "assumptions": list(DEFAULT_ASSUMPTIONS),
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+
+    return [primary] + secondary
+
+
+def build_portfolio_recommendations(
+    granularity: str,
+    category_summaries: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    recommendations = []
+    for item in category_summaries or []:
+        category = str(item.get("category") or "PORTFOLIO")
+        forecast_change_pct = _coerce_float(item.get("forecast_change_pct"), 0.0)
+        volatility_level = _normalize_volatility(item.get("volatility_level"))
+        seasonality_strength = _normalize_seasonality(item.get("seasonality_strength"))
+        anomaly_flag = bool(item.get("anomaly_flag"))
+        data_staleness_days = int(_coerce_float(item.get("data_staleness_days"), 0))
+        selected_model = str(item.get("selected_model") or "Seasonal Naive")
+        model_quality_score = clamp(_coerce_float(item.get("model_quality_score"), 0.5), 0.0, 1.0)
+        forecast_consistency = clamp(_coerce_float(item.get("forecast_consistency"), 0.5), 0.0, 1.0)
+
+        category_recs = build_category_recommendations(
+            category=category,
+            granularity=granularity,
+            horizon=12,
+            forecast_change_pct=forecast_change_pct,
+            volatility_level=volatility_level,
+            seasonality_strength=seasonality_strength,
+            anomaly_flag=anomaly_flag,
+            data_staleness_days=data_staleness_days,
+            selected_model=selected_model,
+            model_quality_score=model_quality_score,
+            forecast_consistency=forecast_consistency,
+        )
+        recommendations.extend(category_recs)
+
+    recommendations.sort(
+        key=lambda rec: (
+            {"high": 0, "medium": 1, "low": 2}[rec["priority"]],
+            -float(rec["confidence_score"]),
+            str(rec["category"] or ""),
+        )
+    )
+    return recommendations
+
+
+def _summarize_category(category: str, granularity: str) -> dict[str, Any]:
+    history = get_category_history(category, granularity)
+    if history.empty:
+        return {}
+
+    forecast_res = generate_forecast(category, granularity, horizon=12)
+    latest_actual = float(history.iloc[-1]) if len(history) else 0.0
+    next_forecast = float(forecast_res.values[0]) if forecast_res.values else 0.0
+    forecast_change_pct = ((next_forecast - latest_actual) / latest_actual * 100) if latest_actual > 0 else 0.0
+
+    freshness_data = get_freshness_data()
+    last_date = freshness_data.last_dates.get(granularity)
+    data_staleness_days = 0
+    if last_date and last_date != "N/A":
+        last_dt = datetime.strptime(last_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        data_staleness_days = max(0, (datetime.now(timezone.utc) - last_dt).days)
+
+    volatility_level = "medium"
+    seasonality_strength = "medium"
+    anomaly_flag = False
+
+    forecaster = get_forecaster(category, granularity)
+    selected_model = getattr(forecaster, "name", "Seasonal Naive")
+
+    model_quality_score = 0.8
+    forecast_consistency = 0.8
+
+    return {
+        "category": category,
+        "forecast_change_pct": forecast_change_pct,
+        "volatility_level": volatility_level,
+        "seasonality_strength": seasonality_strength,
+        "anomaly_flag": anomaly_flag,
+        "data_staleness_days": data_staleness_days,
+        "selected_model": selected_model,
+        "model_quality_score": model_quality_score,
+        "forecast_consistency": forecast_consistency,
+        "latest_actual": latest_actual,
+        "next_forecast": next_forecast,
+    }
+
+
+def get_portfolio_recommendations(granularity: str = "monthly") -> list[dict[str, Any]]:
+    categories = get_categories(granularity)
+    summaries = []
+    for category in categories:
+        summary = _summarize_category(category, granularity)
+        if summary:
+            summaries.append(summary)
+    return build_portfolio_recommendations(granularity=granularity, category_summaries=summaries)
+
+
+def get_category_recommendations(category: str, granularity: str = "monthly", horizon: int = 12) -> list[dict[str, Any]]:
+    if not category:
+        raise ValueError("Category is required.")
+
+    summary = _summarize_category(category, granularity)
+    if not summary:
+        raise ValueError(f"Category '{category}' not found for granularity '{granularity}'.")
+
+    summary["forecast_change_pct"] = _coerce_float(summary.get("forecast_change_pct"), 0.0)
+    return build_category_recommendations(
+        category=category,
+        granularity=granularity,
+        horizon=horizon,
+        forecast_change_pct=summary["forecast_change_pct"],
+        volatility_level=summary.get("volatility_level", "medium"),
+        seasonality_strength=summary.get("seasonality_strength", "medium"),
+        anomaly_flag=bool(summary.get("anomaly_flag", False)),
+        data_staleness_days=int(_coerce_float(summary.get("data_staleness_days"), 0)),
+        selected_model=str(summary.get("selected_model") or "Seasonal Naive"),
+        model_quality_score=_coerce_float(summary.get("model_quality_score"), 0.8),
+        forecast_consistency=_coerce_float(summary.get("forecast_consistency"), 0.8),
+    )
+
+
 === FILE: app\services\trends_service.py ===
+# app/services/trends_service.py
+import logging
 import numpy as np
 import pandas as pd
 from app.data.loader import get_categories, get_category_history, load_dataset
@@ -954,8 +1857,10 @@ from app.services.forecast_service import generate_forecast
 from app.models.registry import get_forecaster
 from app.schemas.trends import TrendsOverviewResponse, MoverInfo, TotalTrend
 
+logger = logging.getLogger(__name__)
 
-def get_trends_overview(granularity: str = "monthly") -> TrendsOverviewResponse:
+
+def get_trends_overview(granularity: str = "weekly") -> TrendsOverviewResponse:
     categories = get_categories(granularity)
     category_trends = []
 
@@ -977,15 +1882,24 @@ def get_trends_overview(granularity: str = "monthly") -> TrendsOverviewResponse:
         if history.empty:
             continue
 
-        # Sum up historical actuals
+        # Sum up historical actuals — this happens regardless of whether the
+        # forecast succeeds below, since the actual sales occurred either way
         for i, val in enumerate(history.tolist()):
             if i < len(total_actuals):
                 total_actuals[i] += val
 
         latest_actual = float(history.iloc[-1])
 
-        # Grab the full horizon forecast
-        forecast_res = generate_forecast(cat, granularity, horizon=horizon)
+        # Grab the full horizon forecast. This is the one call in the loop
+        # that can throw (missing model artifact, TimesFM load failure,
+        # etc.) — isolate it so one bad category doesn't 500 the whole
+        # overview for every other category.
+        try:
+            forecast_res = generate_forecast(cat, granularity, horizon=horizon)
+            forecaster = get_forecaster(cat, granularity)
+        except Exception as e:
+            logger.warning(f"Skipping {cat}/{granularity} in trends overview: {e}")
+            continue
 
         # Sum up future forecasts across all categories
         for i, val in enumerate(forecast_res.values):
@@ -998,7 +1912,7 @@ def get_trends_overview(granularity: str = "monthly") -> TrendsOverviewResponse:
         if latest_actual > 0:
             pct_change = ((next_forecast - latest_actual) / latest_actual) * 100
 
-        # --- NEW ANOMALY LOGIC ---
+        # --- ANOMALY LOGIC ---
         history_list = history.tolist()
         is_anomaly = False
         if len(history_list) >= 8:
@@ -1011,8 +1925,6 @@ def get_trends_overview(granularity: str = "monthly") -> TrendsOverviewResponse:
             if std_val > 0 and abs(latest_actual - mean_val) > (2 * std_val):
                 is_anomaly = True
         # -------------------------
-
-        forecaster = get_forecaster(cat, granularity)
 
         category_trends.append(
             MoverInfo(

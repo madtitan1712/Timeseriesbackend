@@ -8,9 +8,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.routes import audit,auth, categories, compare, diagnostics, export, forecast, freshness, recommendations, trends
 
 app = FastAPI(title="Pharma Sales Dashboard API")
-from app.data.auth_database import init_auth_db
-
-init_auth_db()
+from app.data.database import init_db
+init_db()
 allowed_origins = os.getenv(
     "CORS_ALLOWED_ORIGINS",
     "http://localhost:3000,http://localhost:5173,http://127.0.0.1:3000,http://127.0.0.1:5173,http://localhost:8080,http://127.0.0.1:8080",
