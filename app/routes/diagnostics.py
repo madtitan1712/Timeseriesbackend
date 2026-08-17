@@ -1,40 +1,30 @@
-import os
-import pandas as pd
-from fastapi import APIRouter
+from fastapi import APIRouter, Query
 from app.schemas.diagnostics import DiagnosticsResponse
-from app.core.config import settings
+from app.services.diagnostics_service import compute_diagnostics
 
 router = APIRouter()
 
 
 @router.get("/categories/{category}/diagnostics", response_model=DiagnosticsResponse)
-def get_diagnostics(category: str):
-    """Diagnostics panel data, translating raw metrics to plain language."""
-    file_path = os.path.join(settings.DATA_DIR, "diagnostic_features.csv")
+def get_diagnostics(category: str, granularity: str = Query("weekly")):
+    """Diagnostics panel data, translating raw STL-decomposition metrics
+    into plain language for the UI."""
+    stats = compute_diagnostics(category, granularity)
 
-    if os.path.exists(file_path):
-        df = pd.read_csv(file_path)
-        if category in df['category'].values:
-            row = df[df['category'] == category].iloc[0]
+    if stats["seasonal_strength"] is None:
+        return DiagnosticsResponse(
+            category=category,
+            seasonality_strength="Unknown",
+            volatility="Unknown",
+            notes=stats["notes"],
+        )
 
-            # Simple threshold mappings for the UI plain-language descriptions
-            seasonal_val = row.get('seasonal_strength', 0.0)
-            cv_val = row.get('cv', 0.0)
+    seasonality_text = "Highly Seasonal" if stats["seasonal_strength"] > 0.7 else "Low Seasonality"
+    volatility_text = "High Volatility" if stats["cv"] is not None and stats["cv"] > 1.0 else "Stable"
 
-            seasonality_text = "Highly Seasonal" if seasonal_val > 0.7 else "Low Seasonality"
-            volatility_text = "High Volatility" if cv_val > 1.0 else "Stable"
-
-            return DiagnosticsResponse(
-                category=category,
-                seasonality_strength=seasonality_text,
-                volatility=volatility_text,
-                notes="Derived from diagnostic_features.csv"
-            )
-
-    # Mock fallback until the CSV is dropped into the raw data folder
     return DiagnosticsResponse(
         category=category,
-        seasonality_strength="Highly Seasonal",
-        volatility="Low Volatility",
-        notes="Mocked data: diagnostic_features.csv not found."
+        seasonality_strength=seasonality_text,
+        volatility=volatility_text,
+        notes=stats["notes"],
     )

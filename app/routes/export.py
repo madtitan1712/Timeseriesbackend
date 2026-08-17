@@ -10,7 +10,7 @@ router = APIRouter()
 @router.get("/forecast/{category}/export.csv")
 def export_forecast_csv(
         category: str,
-        granularity: str = Query("monthly"),
+        granularity: str = Query("weekly"),
         horizon: int = Query(12)
 ):
     """CSV export of the forecast data."""

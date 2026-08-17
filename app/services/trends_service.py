@@ -1,3 +1,5 @@
+# app/services/trends_service.py
+import logging
 import numpy as np
 import pandas as pd
 from app.data.loader import get_categories, get_category_history, load_dataset
@@ -5,8 +7,10 @@ from app.services.forecast_service import generate_forecast
 from app.models.registry import get_forecaster
 from app.schemas.trends import TrendsOverviewResponse, MoverInfo, TotalTrend
 
+logger = logging.getLogger(__name__)
 
-def get_trends_overview(granularity: str = "monthly") -> TrendsOverviewResponse:
+
+def get_trends_overview(granularity: str = "weekly") -> TrendsOverviewResponse:
     categories = get_categories(granularity)
     category_trends = []
 
@@ -28,15 +32,24 @@ def get_trends_overview(granularity: str = "monthly") -> TrendsOverviewResponse:
         if history.empty:
             continue
 
-        # Sum up historical actuals
+        # Sum up historical actuals — this happens regardless of whether the
+        # forecast succeeds below, since the actual sales occurred either way
         for i, val in enumerate(history.tolist()):
             if i < len(total_actuals):
                 total_actuals[i] += val
 
         latest_actual = float(history.iloc[-1])
 
-        # Grab the full horizon forecast
-        forecast_res = generate_forecast(cat, granularity, horizon=horizon)
+        # Grab the full horizon forecast. This is the one call in the loop
+        # that can throw (missing model artifact, TimesFM load failure,
+        # etc.) — isolate it so one bad category doesn't 500 the whole
+        # overview for every other category.
+        try:
+            forecast_res = generate_forecast(cat, granularity, horizon=horizon)
+            forecaster = get_forecaster(cat, granularity)
+        except Exception as e:
+            logger.warning(f"Skipping {cat}/{granularity} in trends overview: {e}")
+            continue
 
         # Sum up future forecasts across all categories
         for i, val in enumerate(forecast_res.values):
@@ -49,7 +62,7 @@ def get_trends_overview(granularity: str = "monthly") -> TrendsOverviewResponse:
         if latest_actual > 0:
             pct_change = ((next_forecast - latest_actual) / latest_actual) * 100
 
-        # --- NEW ANOMALY LOGIC ---
+        # --- ANOMALY LOGIC ---
         history_list = history.tolist()
         is_anomaly = False
         if len(history_list) >= 8:
@@ -62,8 +75,6 @@ def get_trends_overview(granularity: str = "monthly") -> TrendsOverviewResponse:
             if std_val > 0 and abs(latest_actual - mean_val) > (2 * std_val):
                 is_anomaly = True
         # -------------------------
-
-        forecaster = get_forecaster(cat, granularity)
 
         category_trends.append(
             MoverInfo(

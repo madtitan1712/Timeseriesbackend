@@ -21,6 +21,12 @@ class Settings(BaseModel):
         "monthly": 12
     }
 
+    # The canonical list of actual sellable drug categories.
+    # Acts as a whitelist to ignore metadata columns (Year, Month, Hour, etc.)
+    CATEGORY_COLUMNS: set[str] = {
+        "M01AB", "M01AE", "N02BA", "N02BE", "N05B", "N05C", "R03", "R06"
+    }
+
 
 settings = Settings()
 
@@ -60,17 +66,15 @@ def load_dataset(granularity: str) -> pd.DataFrame:
 
 
 def get_categories(granularity: str = "monthly") -> list[str]:
-    # Bug Fix: Read from the requested granularity instead of hardcoding "monthly"
+    # Read from the requested granularity
     df = load_dataset(granularity)
     if df.empty:
         return []
 
-    # Assuming the first column is 'datum', the rest are categories
-    cols = list(df.columns)
-    if 'datum' in cols:
-        cols.remove('datum')
+    # Only return columns that are actual sales categories — this safely
+    # ignores datum, Year, Month, Hour, Weekday Name, etc.
+    cols = [c for c in df.columns if c in settings.CATEGORY_COLUMNS]
     return sorted(cols)
-
 
 def get_category_history(category: str, granularity: str) -> pd.Series:
     """Returns the historical values for a specific category column."""
@@ -548,21 +552,16 @@ class XGBoostForecaster(Forecaster):
 
 === FILE: app\routes\audit.py ===
 from fastapi import APIRouter
-from app.schemas.audit import AuditResponse, ModelPerformanceRow
+from app.schemas.audit import AuditResponse
+from app.services.audit_service import get_model_audit
 
 router = APIRouter()
 
 @router.get("/audit/model-performance", response_model=AuditResponse)
-def get_model_audit():
-    """Reads the model-selection team's export file. Mocked for now."""
-    return AuditResponse(
-        metrics=[
-            ModelPerformanceRow(model_name="Seasonal Naive", mase=1.0, smape=15.2, runtime_ms=5),
-            ModelPerformanceRow(model_name="Chronos (Bolt)", mase=0.82, smape=12.1, runtime_ms=450),
-            ModelPerformanceRow(model_name="TimesFM", mase=0.79, smape=11.5, runtime_ms=390),
-            ModelPerformanceRow(model_name="LightGBM", mase=0.85, smape=13.0, runtime_ms=50),
-        ]
-    )
+def get_audit():
+    """Reads the last backtest run's results. Run scripts/run_backtest.py
+    to refresh — this endpoint does not compute metrics on request."""
+    return get_model_audit()
 
 === FILE: app\routes\categories.py ===
 from fastapi import APIRouter, Query
@@ -575,7 +574,7 @@ AVAILABLE_GRANULARITIES = ["daily", "weekly", "monthly"]
 
 
 @router.get("/categories")
-def list_categories(granularity: str = Query("monthly", description="Data granularity")):
+def list_categories(granularity: str = Query("weekly", description="Data granularity")):
     """List categories for the given granularity, plus which granularities exist.
 
     Kept as an object (not a bare list) to match the response shape the
@@ -599,7 +598,7 @@ router = APIRouter()
 @router.get("/compare/forecasts", response_model=Dict[str, ForecastResponse])
 def compare_forecasts(
         categories: str = Query(..., description="Comma-separated categories, e.g., M01AB,R03"),
-        granularity: str = Query("monthly"),
+        granularity: str = Query("weekly"),
         horizon: int = Query(12)
 ):
     """Multi-category overlay data."""
@@ -613,45 +612,35 @@ def compare_forecasts(
     return results
 
 === FILE: app\routes\diagnostics.py ===
-import os
-import pandas as pd
-from fastapi import APIRouter
+from fastapi import APIRouter, Query
 from app.schemas.diagnostics import DiagnosticsResponse
-from app.core.config import settings
+from app.services.diagnostics_service import compute_diagnostics
 
 router = APIRouter()
 
 
 @router.get("/categories/{category}/diagnostics", response_model=DiagnosticsResponse)
-def get_diagnostics(category: str):
-    """Diagnostics panel data, translating raw metrics to plain language."""
-    file_path = os.path.join(settings.DATA_DIR, "diagnostic_features.csv")
+def get_diagnostics(category: str, granularity: str = Query("weekly")):
+    """Diagnostics panel data, translating raw STL-decomposition metrics
+    into plain language for the UI."""
+    stats = compute_diagnostics(category, granularity)
 
-    if os.path.exists(file_path):
-        df = pd.read_csv(file_path)
-        if category in df['category'].values:
-            row = df[df['category'] == category].iloc[0]
+    if stats["seasonal_strength"] is None:
+        return DiagnosticsResponse(
+            category=category,
+            seasonality_strength="Unknown",
+            volatility="Unknown",
+            notes=stats["notes"],
+        )
 
-            # Simple threshold mappings for the UI plain-language descriptions
-            seasonal_val = row.get('seasonal_strength', 0.0)
-            cv_val = row.get('cv', 0.0)
+    seasonality_text = "Highly Seasonal" if stats["seasonal_strength"] > 0.7 else "Low Seasonality"
+    volatility_text = "High Volatility" if stats["cv"] is not None and stats["cv"] > 1.0 else "Stable"
 
-            seasonality_text = "Highly Seasonal" if seasonal_val > 0.7 else "Low Seasonality"
-            volatility_text = "High Volatility" if cv_val > 1.0 else "Stable"
-
-            return DiagnosticsResponse(
-                category=category,
-                seasonality_strength=seasonality_text,
-                volatility=volatility_text,
-                notes="Derived from diagnostic_features.csv"
-            )
-
-    # Mock fallback until the CSV is dropped into the raw data folder
     return DiagnosticsResponse(
         category=category,
-        seasonality_strength="Highly Seasonal",
-        volatility="Low Volatility",
-        notes="Mocked data: diagnostic_features.csv not found."
+        seasonality_strength=seasonality_text,
+        volatility=volatility_text,
+        notes=stats["notes"],
     )
 
 === FILE: app\routes\export.py ===
@@ -667,7 +656,7 @@ router = APIRouter()
 @router.get("/forecast/{category}/export.csv")
 def export_forecast_csv(
         category: str,
-        granularity: str = Query("monthly"),
+        granularity: str = Query("weekly"),
         horizon: int = Query(12)
 ):
     """CSV export of the forecast data."""
@@ -697,7 +686,7 @@ from app.services.forecast_service import generate_forecast
 router = APIRouter()
 
 @router.get("/forecast/{category}", response_model=ForecastResponse)
-def get_forecast(category: str, granularity: str = Query("monthly"), horizon: int = Query(12)):
+def get_forecast(category: str, granularity: str = Query("weekly"), horizon: int = Query(12)):
     try:
         return generate_forecast(category, granularity, horizon)
     except ValueError as e:
@@ -723,7 +712,7 @@ from app.services.trends_service import get_trends_overview
 router = APIRouter()
 
 @router.get("/trends/overview", response_model=TrendsOverviewResponse)
-def get_trends(granularity: str = Query("monthly", description="Data granularity")):
+def get_trends(granularity: str = Query("weekly", description="Data granularity")):
     """Home page aggregate data and computed movers."""
     return get_trends_overview(granularity)
 
@@ -732,16 +721,19 @@ def get_trends(granularity: str = Query("monthly", description="Data granularity
 
 === FILE: app\schemas\audit.py ===
 from pydantic import BaseModel
-from typing import List
+from typing import List, Optional
 
 class ModelPerformanceRow(BaseModel):
     model_name: str
-    mase: float
-    smape: float
+    mase: Optional[float] = None
+    smape: Optional[float] = None
     runtime_ms: int
+    categories_scored: int
 
 class AuditResponse(BaseModel):
     metrics: List[ModelPerformanceRow]
+    evaluated_at: Optional[str] = None
+    skipped_count: int = 0
 
 === FILE: app\schemas\diagnostics.py ===
 from pydantic import BaseModel
@@ -795,6 +787,100 @@ class TrendsOverviewResponse(BaseModel):
 
 === FILE: app\services\__init__.py ===
 
+
+=== FILE: app\services\audit_service.py ===
+import json
+import os
+from collections import defaultdict
+from app.core.config import settings
+
+
+def get_model_audit() -> dict:
+    path = os.path.join(settings.DATA_DIR, "model_performance.json")
+
+    if not os.path.exists(path):
+        return {"metrics": [], "evaluated_at": None, "notes": "No backtest has been run yet. Run scripts/run_backtest.py."}
+
+    with open(path) as f:
+        data = json.load(f)
+
+    by_model = defaultdict(list)
+    for row in data["results"]:
+        by_model[row["model_name"]].append(row)
+
+    metrics = []
+    for model_name, rows in by_model.items():
+        mase_vals = [r["mase"] for r in rows if r["mase"] is not None]
+        smape_vals = [r["smape"] for r in rows if r["smape"] is not None]
+        runtime_vals = [r["runtime_ms"] for r in rows]
+
+        metrics.append({
+            "model_name": model_name,
+            "mase": round(sum(mase_vals) / len(mase_vals), 3) if mase_vals else None,
+            "smape": round(sum(smape_vals) / len(smape_vals), 2) if smape_vals else None,
+            "runtime_ms": round(sum(runtime_vals) / len(runtime_vals)) if runtime_vals else 0,
+            "categories_scored": len(rows),
+        })
+
+    return {
+        "metrics": metrics,
+        "evaluated_at": data["evaluated_at"],
+        "skipped_count": len(data.get("skipped", [])),
+    }
+
+=== FILE: app\services\diagnostics_service.py ===
+import numpy as np
+from statsmodels.tsa.seasonal import STL
+from app.data.loader import get_category_history
+from app.core.config import settings
+
+
+def compute_diagnostics(category: str, granularity: str) -> dict:
+    """Computes seasonality strength and volatility directly from the
+    category's history using STL decomposition — no precomputed file needed.
+
+    Feature definitions follow Hyndman & Athanasopoulos (Forecasting:
+    Principles and Practice), which is why the formulas look like a ratio
+    of residual variance rather than something more ad hoc.
+    """
+    history = get_category_history(category, granularity)
+    period = settings.SEASONAL_PERIODS.get(granularity, 12)
+
+    # STL needs at least 2 full seasonal cycles to decompose meaningfully
+    if len(history) < period * 2:
+        return {
+            "seasonal_strength": None,
+            "trend_strength": None,
+            "cv": None,
+            "notes": f"Not enough history ({len(history)} points) for a {period}-period seasonal decomposition",
+        }
+
+    values = history.to_numpy()
+
+    try:
+        stl = STL(values, period=period, robust=True).fit()
+    except ValueError as e:
+        # Can happen on pathological series (all-zero, all-identical values, etc.)
+        return {
+            "seasonal_strength": None,
+            "trend_strength": None,
+            "cv": None,
+            "notes": f"STL decomposition failed: {e}",
+        }
+
+    var_resid = np.var(stl.resid)
+    seasonal_strength = max(0.0, 1 - var_resid / np.var(stl.seasonal + stl.resid))
+    trend_strength = max(0.0, 1 - var_resid / np.var(stl.trend + stl.resid))
+
+    mean_val = np.mean(values)
+    cv = float(np.std(values) / mean_val) if mean_val != 0 else None
+
+    return {
+        "seasonal_strength": float(seasonal_strength),
+        "trend_strength": float(trend_strength),
+        "cv": cv,
+        "notes": "Computed live via STL decomposition",
+    }
 
 === FILE: app\services\forecast_service.py ===
 import pandas as pd

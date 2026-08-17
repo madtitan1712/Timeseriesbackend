@@ -1,0 +1,134 @@
+{
+  "evaluated_at": "2026-08-17T08:25:18.369316+00:00",
+  "results": [
+    {
+      "model_name": "LightGBM",
+      "category": "N02BE",
+      "granularity": "daily",
+      "mase": 0.7412266174992393,
+      "smape": 20.53091212670789,
+      "runtime_ms": 2745.0
+    },
+    {
+      "model_name": "Theta",
+      "category": "N02BE",
+      "granularity": "weekly",
+      "mase": 0.7617073912211417,
+      "smape": 29.144705500705275,
+      "runtime_ms": 118.2
+    },
+    {
+      "model_name": "LightGBM",
+      "category": "M01AB",
+      "granularity": "daily",
+      "mase": 0.7534275292668077,
+      "smape": 45.72605781545607,
+      "runtime_ms": 44.4
+    },
+    {
+      "model_name": "LightGBM",
+      "category": "M01AB",
+      "granularity": "weekly",
+      "mase": 0.521831310515194,
+      "smape": 23.13211613379311,
+      "runtime_ms": 64.0
+    },
+    {
+      "model_name": "Theta",
+      "category": "N02BA",
+      "granularity": "daily",
+      "mase": 0.47433724579783343,
+      "smape": 48.999821055603405,
+      "runtime_ms": 536.6
+    },
+    {
+      "model_name": "TimesFM",
+      "category": "N02BA",
+      "granularity": "weekly",
+      "mase": 0.41719085801115174,
+      "smape": 27.55447244040854,
+      "runtime_ms": 706.9
+    },
+    {
+      "model_name": "LightGBM",
+      "category": "N05B",
+      "granularity": "daily",
+      "mase": 0.7820367460619199,
+      "smape": 41.36094496008704,
+      "runtime_ms": 37.7
+    },
+    {
+      "model_name": "TimesFM",
+      "category": "N05B",
+      "granularity": "weekly",
+      "mase": 0.4163321863691166,
+      "smape": 21.08055420854531,
+      "runtime_ms": 562.1
+    },
+    {
+      "model_name": "LightGBM",
+      "category": "M01AE",
+      "granularity": "daily",
+      "mase": 0.9320880678328985,
+      "smape": 48.93751456725015,
+      "runtime_ms": 58.4
+    },
+    {
+      "model_name": "Theta",
+      "category": "M01AE",
+      "granularity": "weekly",
+      "mase": 0.9114717005167977,
+      "smape": 26.026252263586684,
+      "runtime_ms": 105.8
+    },
+    {
+      "model_name": "TimesFM",
+      "category": "N05C",
+      "granularity": "daily",
+      "mase": 0.6297684087623164,
+      "smape": 149.90082424730699,
+      "runtime_ms": 717.4
+    },
+    {
+      "model_name": "XGBoost",
+      "category": "N05C",
+      "granularity": "weekly",
+      "mase": 0.86424747357337,
+      "smape": 73.97071591526802,
+      "runtime_ms": 53.3
+    },
+    {
+      "model_name": "TimesFM",
+      "category": "R03",
+      "granularity": "daily",
+      "mase": 0.764889478834325,
+      "smape": 101.21089359408049,
+      "runtime_ms": 607.4
+    },
+    {
+      "model_name": "XGBoost",
+      "category": "R03",
+      "granularity": "weekly",
+      "mase": 1.745196343613155,
+      "smape": 77.92972413054925,
+      "runtime_ms": 63.7
+    },
+    {
+      "model_name": "LightGBM",
+      "category": "R06",
+      "granularity": "daily",
+      "mase": 0.5910427362228923,
+      "smape": 65.46542775809459,
+      "runtime_ms": 66.4
+    },
+    {
+      "model_name": "LightGBM",
+      "category": "R06",
+      "granularity": "weekly",
+      "mase": 2.9713853563121115,
+      "smape": 62.16676530185726,
+      "runtime_ms": 34.9
+    }
+  ],
+  "skipped": []
+}

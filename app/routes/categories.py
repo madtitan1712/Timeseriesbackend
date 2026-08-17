@@ -8,7 +8,7 @@ AVAILABLE_GRANULARITIES = ["daily", "weekly", "monthly"]
 
 
 @router.get("/categories")
-def list_categories(granularity: str = Query("monthly", description="Data granularity")):
+def list_categories(granularity: str = Query("weekly", description="Data granularity")):
     """List categories for the given granularity, plus which granularities exist.
 
     Kept as an object (not a bare list) to match the response shape the

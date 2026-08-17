@@ -1,16 +1,26 @@
+# app/main.py
+import logging
+from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.routes import audit, categories, compare, diagnostics, export, forecast, freshness, trends
+from app.models.registry import warm_up_models
 
-app = FastAPI(title="Pharma Sales Dashboard API")
+logging.basicConfig(level=logging.INFO)
 
-# allow_credentials=False here deliberately: allow_origins=["*"] combined
-# with allow_credentials=True is rejected by browsers per the CORS spec
-# (a wildcard origin can't be paired with credentialed requests). This app
-# doesn't use cookies/auth, so there's nothing to gain from credentials
-# support — if that changes later, set an explicit origin list instead of
-# "*" and turn allow_credentials back on.
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Blocks startup until every model is loaded, so the first real request
+    # is never the one paying for TimesFM's cold start — trade a slower
+    # deploy/restart for consistently fast requests afterward.
+    warm_up_models()
+    yield
+
+
+app = FastAPI(title="Pharma Sales Dashboard API", lifespan=lifespan)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],

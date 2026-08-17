@@ -5,7 +5,7 @@ from app.services.forecast_service import generate_forecast
 router = APIRouter()
 
 @router.get("/forecast/{category}", response_model=ForecastResponse)
-def get_forecast(category: str, granularity: str = Query("monthly"), horizon: int = Query(12)):
+def get_forecast(category: str, granularity: str = Query("weekly"), horizon: int = Query(12)):
     try:
         return generate_forecast(category, granularity, horizon)
     except ValueError as e:
