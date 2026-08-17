@@ -132,98 +132,103 @@ def decode_access_token(token: str) -> dict:
 
 
 === FILE: app\data\auth_database.py ===
-import sqlite3
-from pathlib import Path
-
-
-# Project root:
-# Timeseriesbackend/
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-
-DATA_DIR = PROJECT_ROOT / "data"
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-
-DB_PATH = DATA_DIR / "auth.db"
+from app.data.database import engine, init_db
 
 
 def get_connection():
-    connection = sqlite3.connect(DB_PATH)
-    connection.row_factory = sqlite3.Row
-    return connection
+    return engine.connect()
 
 
 def init_auth_db():
-    connection = get_connection()
-
-    connection.execute(
-        """
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            email TEXT NOT NULL UNIQUE,
-            password_hash TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-        """
-    )
-
-    connection.commit()
-    connection.close()
+    init_db()
 
 === FILE: app\data\database.py ===
+import os
+from urllib.parse import quote_plus
 
+from sqlalchemy import create_engine, text
+
+
+def _build_database_url() -> str:
+    url = os.getenv("DATABASE_URL")
+    if url:
+        return url
+    user = os.getenv("PGUSER", "postgres")
+    password = quote_plus(os.getenv("PGPASSWORD", ""))
+    host = os.getenv("PGHOST", "localhost")
+    port = os.getenv("PGPORT", "5432")
+    dbname = os.getenv("PGDATABASE", "postgres")
+    return f"postgresql+psycopg2://{user}:{password}@{host}:{port}/{dbname}"
+
+DATABASE_URL = _build_database_url()
+engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+
+
+def init_db():
+    """Creates both tables if they don't exist. Safe to call on every startup."""
+    with engine.begin() as conn:
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS sales (
+                id SERIAL PRIMARY KEY,
+                granularity TEXT NOT NULL,
+                category TEXT NOT NULL,
+                date DATE NOT NULL,
+                value REAL NOT NULL,
+                UNIQUE(granularity, category, date)
+            )
+        """))
+        conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS idx_sales_lookup ON sales(granularity, category, date)"
+        ))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS users (
+                id SERIAL PRIMARY KEY,
+                name TEXT NOT NULL,
+                email TEXT NOT NULL UNIQUE,
+                password_hash TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """))
 
 === FILE: app\data\loader.py ===
 import pandas as pd
-import os
+from sqlalchemy import text
 from app.core.config import settings
+from app.data.database import engine
 
-# In-memory cache to prevent reloading CSVs on every request
 _DATA_CACHE: dict[str, pd.DataFrame] = {}
 
 
 def load_dataset(granularity: str) -> pd.DataFrame:
-    """Loads and caches data from the wide-format CSVs."""
     if granularity in _DATA_CACHE:
         return _DATA_CACHE[granularity]
 
-    # Maps 'monthly' to 'salesmonthly.csv', 'weekly' to 'salesweekly.csv', etc.
-    filename = f"sales{granularity}.csv"
-    file_path = os.path.join(settings.DATA_DIR, filename)
+    query = text("SELECT date AS datum, category, value FROM sales WHERE granularity = :g ORDER BY date")
+    with engine.connect() as conn:
+        long_df = pd.read_sql_query(query, conn, params={"g": granularity}, parse_dates=["datum"])
 
-    if not os.path.exists(file_path):
+    if long_df.empty:
         return pd.DataFrame()
 
-    df = pd.read_csv(file_path)
-
-    # Ensure the time column is parsed and sorted properly
-    if 'datum' in df.columns:
-        df['datum'] = pd.to_datetime(df['datum'])
-        df = df.sort_values(by=['datum']).reset_index(drop=True)
+    df = long_df.pivot(index="datum", columns="category", values="value").reset_index()
+    df = df.sort_values(by="datum").reset_index(drop=True)
 
     _DATA_CACHE[granularity] = df
     return df
 
 
 def get_categories(granularity: str = "monthly") -> list[str]:
-    # Read from the requested granularity
     df = load_dataset(granularity)
     if df.empty:
         return []
-
-    # Only return columns that are actual sales categories — this safely
-    # ignores datum, Year, Month, Hour, Weekday Name, etc.
     cols = [c for c in df.columns if c in settings.CATEGORY_COLUMNS]
     return sorted(cols)
 
-def get_category_history(category: str, granularity: str) -> pd.Series:
-    """Returns the historical values for a specific category column."""
-    df = load_dataset(granularity)
 
+def get_category_history(category: str, granularity: str) -> pd.Series:
+    df = load_dataset(granularity)
     if df.empty or category not in df.columns:
         return pd.Series(dtype=float)
-
-    # Extract just the specific category column, drop any accidental empty trailing rows
     return df[category].dropna().reset_index(drop=True)
 
 === FILE: app\main.py ===
@@ -237,9 +242,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.routes import audit,auth, categories, compare, diagnostics, export, forecast, freshness, recommendations, trends
 
 app = FastAPI(title="Pharma Sales Dashboard API")
-from app.data.auth_database import init_auth_db
-
-init_auth_db()
+from app.data.database import init_db
+init_db()
 allowed_origins = os.getenv(
     "CORS_ALLOWED_ORIGINS",
     "http://localhost:3000,http://localhost:5173,http://127.0.0.1:3000,http://127.0.0.1:5173,http://localhost:8080,http://127.0.0.1:8080",
@@ -1258,149 +1262,60 @@ def get_model_audit() -> dict:
     }
 
 === FILE: app\services\auth_service.py ===
-import sqlite3
+from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 
-from app.core.security import (
-    create_access_token,
-    hash_password,
-    verify_password,
-)
-from app.data.auth_database import get_connection
+from app.core.security import create_access_token, hash_password, verify_password
+from app.data.database import engine
 
 
 def create_user(name: str, email: str, password: str):
     email = email.strip().lower()
-
-    connection = get_connection()
+    password_hash = hash_password(password)
 
     try:
-        existing_user = connection.execute(
-            "SELECT id FROM users WHERE email = ?",
-            (email,),
-        ).fetchone()
-
-        if existing_user:
-            raise ValueError("An account with this email already exists.")
-
-        password_hash = hash_password(password)
-
-        cursor = connection.execute(
-            """
-            INSERT INTO users (
-                name,
-                email,
-                password_hash
+        with engine.begin() as conn:
+            result = conn.execute(
+                text("""INSERT INTO users (name, email, password_hash)
+                        VALUES (:name, :email, :password_hash) RETURNING id"""),
+                {"name": name.strip(), "email": email, "password_hash": password_hash},
             )
-            VALUES (?, ?, ?)
-            """,
-            (
-                name.strip(),
-                email,
-                password_hash,
-            ),
-        )
-
-        connection.commit()
-
-        user_id = cursor.lastrowid
-
-        return {
-            "id": user_id,
-            "name": name.strip(),
-            "email": email,
-        }
-
-    except sqlite3.IntegrityError:
-        connection.rollback()
+            user_id = result.scalar_one()
+    except IntegrityError:
         raise ValueError("An account with this email already exists.")
 
-    finally:
-        connection.close()
+    return {"id": user_id, "name": name.strip(), "email": email}
 
 
 def authenticate_user(email: str, password: str):
     email = email.strip().lower()
+    with engine.connect() as conn:
+        row = conn.execute(
+            text("SELECT id, name, email, password_hash FROM users WHERE email = :email"),
+            {"email": email},
+        ).mappings().first()
 
-    connection = get_connection()
-
-    try:
-        user = connection.execute(
-            """
-            SELECT
-                id,
-                name,
-                email,
-                password_hash
-            FROM users
-            WHERE email = ?
-            """,
-            (email,),
-        ).fetchone()
-
-        if not user:
-            return None
-
-        if not verify_password(
-            password,
-            user["password_hash"],
-        ):
-            return None
-
-        return {
-            "id": user["id"],
-            "name": user["name"],
-            "email": user["email"],
-        }
-
-    finally:
-        connection.close()
+    if not row or not verify_password(password, row["password_hash"]):
+        return None
+    return {"id": row["id"], "name": row["name"], "email": row["email"]}
 
 
 def login_user(email: str, password: str):
     user = authenticate_user(email, password)
-
     if not user:
         return None
-
-    token = create_access_token(
-        user_id=user["id"],
-        email=user["email"],
-    )
-
-    return {
-        "access_token": token,
-        "token_type": "bearer",
-        "user": user,
-    }
+    token = create_access_token(user_id=user["id"], email=user["email"])
+    return {"access_token": token, "token_type": "bearer", "user": user}
 
 
 def get_user_by_id(user_id: int):
-    connection = get_connection()
-
-    try:
-        user = connection.execute(
-            """
-            SELECT
-                id,
-                name,
-                email
-            FROM users
-            WHERE id = ?
-            """,
-            (user_id,),
-        ).fetchone()
-
-        if not user:
-            return None
-
-        return {
-            "id": user["id"],
-            "name": user["name"],
-            "email": user["email"],
-        }
-
-    finally:
-        connection.close()
+    with engine.connect() as conn:
+        row = conn.execute(
+            text("SELECT id, name, email FROM users WHERE id = :id"), {"id": user_id}
+        ).mappings().first()
+    if not row:
+        return None
+    return {"id": row["id"], "name": row["name"], "email": row["email"]}
 
 === FILE: app\services\diagnostics_service.py ===
 import numpy as np

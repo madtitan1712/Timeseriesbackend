@@ -37,3 +37,7 @@ def get_category_history(category: str, granularity: str) -> pd.Series:
     if df.empty or category not in df.columns:
         return pd.Series(dtype=float)
     return df[category].dropna().reset_index(drop=True)
+
+def invalidate_data_cache(granularity: str):
+    """Safely clear the cache for a specific granularity."""
+    _DATA_CACHE.pop(granularity, None)

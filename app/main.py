@@ -5,7 +5,8 @@ load_dotenv()
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.routes import audit,auth, categories, compare, diagnostics, export, forecast, freshness, recommendations, trends
+from app.routes import audit, auth, categories, compare, diagnostics, export, forecast, freshness, recommendations, \
+    trends, data_upload
 
 app = FastAPI(title="Pharma Sales Dashboard API")
 from app.data.database import init_db
@@ -36,7 +37,7 @@ app.include_router(export.router)
 app.include_router(audit.router)
 app.include_router(recommendations.router)
 app.include_router(auth.router)
-
+app.include_router(data_upload.router)
 @app.get("/health")
 def health_check():
     """Liveness check for the dashboard build spec."""

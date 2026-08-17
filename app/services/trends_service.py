@@ -1,5 +1,7 @@
 # app/services/trends_service.py
 import logging
+from typing import Optional
+
 import numpy as np
 import pandas as pd
 from app.data.loader import get_categories, get_category_history, load_dataset
@@ -9,8 +11,31 @@ from app.schemas.trends import TrendsOverviewResponse, MoverInfo, TotalTrend
 
 logger = logging.getLogger(__name__)
 
+# --- NEW CACHING LAYER ---
+_TRENDS_CACHE: dict[str, TrendsOverviewResponse] = {}
+
+
+def invalidate_trends_cache(granularity: Optional[str] = None):
+    """Clear trends cache. If no granularity provided, clear all."""
+    if granularity:
+        _TRENDS_CACHE.pop(granularity, None)
+    else:
+        _TRENDS_CACHE.clear()
+
 
 def get_trends_overview(granularity: str = "weekly") -> TrendsOverviewResponse:
+    """Returns the trends overview, utilizing an in-memory cache."""
+    if granularity in _TRENDS_CACHE:
+        return _TRENDS_CACHE[granularity]
+
+    result = _compute_trends_overview(granularity)
+    _TRENDS_CACHE[granularity] = result
+    return result
+
+
+# -------------------------
+
+def _compute_trends_overview(granularity: str = "weekly") -> TrendsOverviewResponse:
     categories = get_categories(granularity)
     category_trends = []
 
