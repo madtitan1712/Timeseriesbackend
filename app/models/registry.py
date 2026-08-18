@@ -84,10 +84,8 @@ def get_forecaster(category: str, granularity: str) -> Forecaster:
 
         model_id = _ASSIGNMENTS.get(key)
 
-        if model_id == "chronos":
-            from app.models.chronos_model import ChronosForecaster
-            forecaster = ChronosForecaster()
-        elif model_id == "timesfm":
+
+        if model_id == "timesfm":
             forecaster = _get_timesfm_instance()
         elif model_id == "lightgbm":
             from app.models.lightgbm_model import LightGBMForecaster
